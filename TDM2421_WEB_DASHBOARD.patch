@@ -1,0 +1,1177 @@
+--- /mnt/data/arduremoteid_original/arduremoteid/RemoteIDModule/tdm2421_mqtt.h	2026-09-11 03:24:11.000000000 +0000
++++ /mnt/data/arduremoteid_mod/arduremoteid/RemoteIDModule/tdm2421_mqtt.h	2026-09-13 10:20:03.555466962 +0000
+@@ -5,11 +5,34 @@
+ 
+ #if defined(BOARD_TDM2421)
+ 
++struct TDM2421Config {
++    char apn[33];
++    char mqtt_host[65];
++    uint16_t mqtt_port;
++    char mqtt_user[33];
++    char mqtt_pass[65];
++    char mqtt_client[65];
++    char mqtt_topic[97];
++    char device_id[33];
++    char version[17];
++    char bandwidth[17];
++    uint32_t publish_interval_ms;
++    uint32_t reconnect_interval_ms;
++};
++
+ class TDM2421MQTT {
+ public:
+     void begin();
+     void submit(const ODID_UAS_Data &uas, uint8_t wifi_channel);
+ 
++    // Runtime configuration stored in ESP32 NVS namespace "tdmnet".
++    void getConfig(TDM2421Config &out);
++    bool saveConfig(const TDM2421Config &cfg);
++
++    // JSON helpers for the local Web dashboard. Passwords are never returned.
++    String configJson();
++    String statusJson();
++
+ private:
+     static void taskEntry(void *arg);
+     void task();
+@@ -19,11 +42,20 @@
+     bool ensureMQTT();
+     bool syncTime();
+     bool publishSnapshot();
++    void refreshSignal();
++    void handleReconfigure();
+ 
+     String sendAT(const String &cmd, uint32_t timeout_ms = 2000);
+     bool waitFor(const String &needle, uint32_t timeout_ms, String *capture = nullptr);
+     void clearRX();
+ 
++    void loadConfig();
++    void setError(const char *msg);
++    void setError(const String &msg);
++    void setNetworkState(bool value);
++    void setMQTTState(bool value);
++    static String jsonEscape(const String &s);
++
+     uint64_t nowUnixMs() const;
+     uint64_t parseQLTS(const String &s) const;
+     static int64_t daysFromCivil(int y, unsigned m, unsigned d);
+@@ -34,9 +66,21 @@
+     uint8_t snapshot_wifi_channel = 6;
+     bool have_snapshot = false;
+ 
++    SemaphoreHandle_t config_mutex = nullptr;
++    TDM2421Config config {};
++    volatile bool reconfigure_requested = false;
++
++    SemaphoreHandle_t state_mutex = nullptr;
++    bool sim_ready = false;
++    bool registered = false;
+     bool network_ok = false;
+     bool mqtt_ok = false;
+     bool time_ok = false;
++    int rssi_dbm = 0;
++    char lte_ip[32] {};
++    char last_error[96] {};
++    uint32_t last_publish_ok_ms = 0;
++
+     uint64_t unix_base_ms = 0;
+     uint32_t millis_base = 0;
+     uint32_t msg_count = 0;
+--- /mnt/data/arduremoteid_original/arduremoteid/RemoteIDModule/tdm2421_mqtt.cpp	2026-09-13 09:06:56.000000000 +0000
++++ /mnt/data/arduremoteid_mod/arduremoteid/RemoteIDModule/tdm2421_mqtt.cpp	2026-09-13 10:20:03.556604052 +0000
+@@ -3,33 +3,163 @@
+ #if defined(BOARD_TDM2421)
+ 
+ #include "board_config.h"
++#include <Preferences.h>
+ #include <inttypes.h>
+ 
+ // -----------------------------------------------------------------------------
+-// USER CONFIGURATION
+-// Change these values for the real SIM and MQTT server.
++// Factory defaults. They are copied to NVS on first use and can then be changed
++// from the TDM2421 local Web dashboard without rebuilding the firmware.
+ // -----------------------------------------------------------------------------
+-static const char *TDM_APN          = "v-internet";
+-static const char *TDM_MQTT_HOST    = "171.251.89.98";
+-static const uint16_t TDM_MQTT_PORT = 8903;
+-static const char *TDM_MQTT_USER    = "pilot";
+-static const char *TDM_MQTT_PASS    = "pilot123";
+-static const char *TDM_MQTT_CLIENT  = "P3000M_TDM2421";
+-static const char *TDM_MQTT_TOPIC   = "p3000m/data";
+-static const char *TDM_DEVICE_ID    = "P3000M";
+-static const char *TDM_VERSION      = "V1.0";
+-static const char *TDM_BANDWIDTH    = "20MHz";
+-static const uint32_t TDM_PUBLISH_INTERVAL_MS = 1000;
+-static const uint32_t TDM_RECONNECT_INTERVAL_MS = 5000;
++static const char *DEFAULT_APN          = "v-internet";
++static const char *DEFAULT_MQTT_HOST    = "171.251.89.98";
++static const uint16_t DEFAULT_MQTT_PORT = 8903;
++static const char *DEFAULT_MQTT_USER    = "pilot";
++static const char *DEFAULT_MQTT_PASS    = "pilot123";
++static const char *DEFAULT_MQTT_CLIENT  = "P3000M_TDM2421";
++static const char *DEFAULT_MQTT_TOPIC   = "p3000m/data";
++static const char *DEFAULT_DEVICE_ID    = "P3000M";
++static const char *DEFAULT_VERSION      = "V1.0";
++static const char *DEFAULT_BANDWIDTH    = "20MHz";
++static const uint32_t DEFAULT_PUBLISH_INTERVAL_MS = 1000;
++static const uint32_t DEFAULT_RECONNECT_INTERVAL_MS = 5000;
+ 
+ TDM2421MQTT tdm2421_mqtt;
+ 
++template <size_t N>
++static void copyString(char (&dst)[N], const String &src)
++{
++    memset(dst, 0, N);
++    src.substring(0, N - 1).toCharArray(dst, N);
++}
++
++template <size_t N>
++static void copyCString(char (&dst)[N], const char *src)
++{
++    memset(dst, 0, N);
++    if (src != nullptr) {
++        strncpy(dst, src, N - 1);
++    }
++}
++
+ void TDM2421MQTT::begin()
+ {
+     snapshot_mutex = xSemaphoreCreateMutex();
++    config_mutex = xSemaphoreCreateMutex();
++    state_mutex = xSemaphoreCreateMutex();
++
++    loadConfig();
+     xTaskCreate(taskEntry, "tdm_mqtt", 8192, this, 1, nullptr);
+ }
+ 
++void TDM2421MQTT::loadConfig()
++{
++    TDM2421Config cfg {};
++    copyCString(cfg.apn, DEFAULT_APN);
++    copyCString(cfg.mqtt_host, DEFAULT_MQTT_HOST);
++    cfg.mqtt_port = DEFAULT_MQTT_PORT;
++    copyCString(cfg.mqtt_user, DEFAULT_MQTT_USER);
++    copyCString(cfg.mqtt_pass, DEFAULT_MQTT_PASS);
++    copyCString(cfg.mqtt_client, DEFAULT_MQTT_CLIENT);
++    copyCString(cfg.mqtt_topic, DEFAULT_MQTT_TOPIC);
++    copyCString(cfg.device_id, DEFAULT_DEVICE_ID);
++    copyCString(cfg.version, DEFAULT_VERSION);
++    copyCString(cfg.bandwidth, DEFAULT_BANDWIDTH);
++    cfg.publish_interval_ms = DEFAULT_PUBLISH_INTERVAL_MS;
++    cfg.reconnect_interval_ms = DEFAULT_RECONNECT_INTERVAL_MS;
++
++    Preferences prefs;
++    if (prefs.begin("tdmnet", false)) {
++        copyString(cfg.apn, prefs.getString("apn", cfg.apn));
++        copyString(cfg.mqtt_host, prefs.getString("host", cfg.mqtt_host));
++        cfg.mqtt_port = prefs.getUShort("port", cfg.mqtt_port);
++        copyString(cfg.mqtt_user, prefs.getString("user", cfg.mqtt_user));
++        copyString(cfg.mqtt_pass, prefs.getString("pass", cfg.mqtt_pass));
++        copyString(cfg.mqtt_client, prefs.getString("client", cfg.mqtt_client));
++        copyString(cfg.mqtt_topic, prefs.getString("topic", cfg.mqtt_topic));
++        copyString(cfg.device_id, prefs.getString("device", cfg.device_id));
++        copyString(cfg.version, prefs.getString("version", cfg.version));
++        copyString(cfg.bandwidth, prefs.getString("bandwidth", cfg.bandwidth));
++        cfg.publish_interval_ms = prefs.getUInt("pub_ms", cfg.publish_interval_ms);
++        cfg.reconnect_interval_ms = prefs.getUInt("recon_ms", cfg.reconnect_interval_ms);
++
++        // Store defaults/current values so the namespace is fully initialised.
++        prefs.putString("apn", cfg.apn);
++        prefs.putString("host", cfg.mqtt_host);
++        prefs.putUShort("port", cfg.mqtt_port);
++        prefs.putString("user", cfg.mqtt_user);
++        prefs.putString("pass", cfg.mqtt_pass);
++        prefs.putString("client", cfg.mqtt_client);
++        prefs.putString("topic", cfg.mqtt_topic);
++        prefs.putString("device", cfg.device_id);
++        prefs.putString("version", cfg.version);
++        prefs.putString("bandwidth", cfg.bandwidth);
++        prefs.putUInt("pub_ms", cfg.publish_interval_ms);
++        prefs.putUInt("recon_ms", cfg.reconnect_interval_ms);
++        prefs.end();
++    }
++
++    if (cfg.mqtt_port == 0) cfg.mqtt_port = DEFAULT_MQTT_PORT;
++    if (cfg.publish_interval_ms < 250) cfg.publish_interval_ms = DEFAULT_PUBLISH_INTERVAL_MS;
++    if (cfg.reconnect_interval_ms < 1000) cfg.reconnect_interval_ms = DEFAULT_RECONNECT_INTERVAL_MS;
++
++    if (config_mutex && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
++        memcpy(&config, &cfg, sizeof(config));
++        xSemaphoreGive(config_mutex);
++    } else {
++        memcpy(&config, &cfg, sizeof(config));
++    }
++}
++
++void TDM2421MQTT::getConfig(TDM2421Config &out)
++{
++    memset(&out, 0, sizeof(out));
++    if (config_mutex && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
++        memcpy(&out, &config, sizeof(out));
++        xSemaphoreGive(config_mutex);
++    } else {
++        memcpy(&out, &config, sizeof(out));
++    }
++}
++
++bool TDM2421MQTT::saveConfig(const TDM2421Config &cfg)
++{
++    if (cfg.apn[0] == '\0' || cfg.mqtt_host[0] == '\0' || cfg.mqtt_port == 0 ||
++        cfg.mqtt_client[0] == '\0' || cfg.mqtt_topic[0] == '\0' ||
++        cfg.device_id[0] == '\0' || cfg.publish_interval_ms < 250 ||
++        cfg.publish_interval_ms > 60000 || cfg.reconnect_interval_ms < 1000 ||
++        cfg.reconnect_interval_ms > 300000) {
++        return false;
++    }
++
++    Preferences prefs;
++    if (!prefs.begin("tdmnet", false)) {
++        return false;
++    }
++    prefs.putString("apn", cfg.apn);
++    prefs.putString("host", cfg.mqtt_host);
++    prefs.putUShort("port", cfg.mqtt_port);
++    prefs.putString("user", cfg.mqtt_user);
++    prefs.putString("pass", cfg.mqtt_pass);
++    prefs.putString("client", cfg.mqtt_client);
++    prefs.putString("topic", cfg.mqtt_topic);
++    prefs.putString("device", cfg.device_id);
++    prefs.putString("version", cfg.version);
++    prefs.putString("bandwidth", cfg.bandwidth);
++    prefs.putUInt("pub_ms", cfg.publish_interval_ms);
++    prefs.putUInt("recon_ms", cfg.reconnect_interval_ms);
++    prefs.end();
++
++    if (config_mutex && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
++        memcpy(&config, &cfg, sizeof(config));
++        xSemaphoreGive(config_mutex);
++    } else {
++        return false;
++    }
++
++    reconfigure_requested = true;
++    return true;
++}
++
+ void TDM2421MQTT::submit(const ODID_UAS_Data &uas, uint8_t wifi_channel)
+ {
+     if (snapshot_mutex == nullptr || !uas.LocationValid) {
+@@ -88,16 +218,12 @@
+             char c = (char)Serial0.read();
+             buf += c;
+             if (buf.indexOf(needle) >= 0) {
+-                if (capture) {
+-                    *capture = buf;
+-                }
++                if (capture) *capture = buf;
+                 Serial.printf("[EG800K] << %s\n", buf.c_str());
+                 return true;
+             }
+             if (buf.indexOf("ERROR") >= 0) {
+-                if (capture) {
+-                    *capture = buf;
+-                }
++                if (capture) *capture = buf;
+                 Serial.printf("[EG800K] << %s\n", buf.c_str());
+                 return false;
+             }
+@@ -107,46 +233,71 @@
+         }
+         delay(1);
+     }
+-    if (capture) {
+-        *capture = buf;
+-    }
+-    if (buf.length()) {
+-        Serial.printf("[EG800K] << %s\n", buf.c_str());
+-    }
++    if (capture) *capture = buf;
++    if (buf.length()) Serial.printf("[EG800K] << %s\n", buf.c_str());
+     return false;
+ }
+ 
++void TDM2421MQTT::setError(const char *msg)
++{
++    if (state_mutex && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
++        copyCString(last_error, msg ? msg : "");
++        xSemaphoreGive(state_mutex);
++    }
++}
++
++void TDM2421MQTT::setError(const String &msg)
++{
++    setError(msg.c_str());
++}
++
++void TDM2421MQTT::setNetworkState(bool value)
++{
++    network_ok = value;
++    if (!value) mqtt_ok = false;
++}
++
++void TDM2421MQTT::setMQTTState(bool value)
++{
++    mqtt_ok = value;
++}
++
+ bool TDM2421MQTT::modemReady()
+ {
+     for (uint8_t i = 0; i < 20; i++) {
+         String r = sendAT("AT", 500);
+         if (r.indexOf("OK") >= 0) {
+             sendAT("ATE0", 500);
++            setError("");
+             return true;
+         }
+         delay(500);
+     }
++    setError("EG800K not responding");
+     return false;
+ }
+ 
+ bool TDM2421MQTT::ensureNetwork()
+ {
++    TDM2421Config cfg {};
++    getConfig(cfg);
++
+     if (network_ok) {
+-        // Verify PDP is still active.
+         String r = sendAT("AT+QIACT?", 1000);
+         if (r.indexOf("+QIACT: 1") >= 0) {
+             return true;
+         }
+-        network_ok = false;
+-        mqtt_ok = false;
++        setNetworkState(false);
+     }
+ 
+     String r = sendAT("AT+CPIN?", 1000);
+-    if (r.indexOf("+CPIN: READY") < 0) {
++    sim_ready = (r.indexOf("+CPIN: READY") >= 0);
++    if (!sim_ready) {
++        setError("SIM not ready");
+         return false;
+     }
+ 
+-    bool registered = false;
++    registered = false;
+     for (uint8_t i = 0; i < 30; i++) {
+         r = sendAT("AT+CEREG?", 700);
+         if (r.indexOf(",1") >= 0 || r.indexOf(",5") >= 0) {
+@@ -156,29 +307,45 @@
+         delay(500);
+     }
+     if (!registered) {
++        setError("LTE registration failed");
+         return false;
+     }
+ 
+-    String cmd = "AT+QICSGP=1,1,\"" + String(TDM_APN) + "\",\"\",\"\",1";
++    String cmd = "AT+QICSGP=1,1,\"" + String(cfg.apn) + "\",\"\",\"\",1";
+     sendAT(cmd, 1500);
+ 
+     // If context is already active QIACT can return ERROR, so query afterwards.
+     sendAT("AT+QIACT=1", 10000);
+     r = sendAT("AT+QIACT?", 1500);
+     if (r.indexOf("+QIACT: 1") < 0) {
++        setError("PDP activation failed");
+         return false;
+     }
+ 
+-    network_ok = true;
++    // Capture the assigned IP address when present.
++    const int p = r.indexOf("+QIACT: 1");
++    const int q1 = r.indexOf('"', p);
++    const int q2 = (q1 >= 0) ? r.indexOf('"', q1 + 1) : -1;
++    if (q1 >= 0 && q2 > q1) {
++        String ip = r.substring(q1 + 1, q2);
++        if (state_mutex && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
++            copyString(lte_ip, ip);
++            xSemaphoreGive(state_mutex);
++        }
++    }
++
++    setNetworkState(true);
++    setError("");
+     Serial.println("[MQTT] LTE/PDP ready");
+     return true;
+ }
+ 
+ bool TDM2421MQTT::ensureMQTT()
+ {
+-    if (mqtt_ok) {
+-        return true;
+-    }
++    if (mqtt_ok) return true;
++
++    TDM2421Config cfg {};
++    getConfig(cfg);
+ 
+     sendAT("AT+QMTDISC=0", 500);
+     sendAT("AT+QMTCLOSE=0", 500);
+@@ -188,29 +355,35 @@
+     sendAT("AT+QMTCFG=\"keepalive\",0,60", 500);
+ 
+     clearRX();
+-    String cmd = "AT+QMTOPEN=0,\"" + String(TDM_MQTT_HOST) + "\"," + String(TDM_MQTT_PORT);
++    String cmd = "AT+QMTOPEN=0,\"" + String(cfg.mqtt_host) + "\"," + String(cfg.mqtt_port);
+     Serial.printf("[MQTT] >> %s\n", cmd.c_str());
+     Serial0.println(cmd);
+     if (!waitFor("+QMTOPEN: 0,0", 30000)) {
++        setError("MQTT QMTOPEN failed");
+         Serial.println("[MQTT] QMTOPEN failed");
+         return false;
+     }
+ 
+     clearRX();
+-    if (strlen(TDM_MQTT_USER) == 0) {
+-        cmd = "AT+QMTCONN=0,\"" + String(TDM_MQTT_CLIENT) + "\"";
++    if (strlen(cfg.mqtt_user) == 0) {
++        cmd = "AT+QMTCONN=0,\"" + String(cfg.mqtt_client) + "\"";
++        Serial.printf("[MQTT] >> %s\n", cmd.c_str());
+     } else {
+-        cmd = "AT+QMTCONN=0,\"" + String(TDM_MQTT_CLIENT) + "\",\"" +
+-              String(TDM_MQTT_USER) + "\",\"" + String(TDM_MQTT_PASS) + "\"";
++        cmd = "AT+QMTCONN=0,\"" + String(cfg.mqtt_client) + "\",\"" +
++              String(cfg.mqtt_user) + "\",\"" + String(cfg.mqtt_pass) + "\"";
++        // Do not print the password in the USB debug log.
++        Serial.printf("[MQTT] >> AT+QMTCONN=0,\"%s\",\"%s\",\"********\"\n",
++                      cfg.mqtt_client, cfg.mqtt_user);
+     }
+-    Serial.printf("[MQTT] >> %s\n", cmd.c_str());
+     Serial0.println(cmd);
+     if (!waitFor("+QMTCONN: 0,0,0", 15000)) {
++        setError("MQTT authentication/connect failed");
+         Serial.println("[MQTT] QMTCONN failed");
+         return false;
+     }
+ 
+-    mqtt_ok = true;
++    setMQTTState(true);
++    setError("");
+     Serial.println("[MQTT] connected");
+     return true;
+ }
+@@ -255,6 +428,7 @@
+     String r = sendAT("AT+QLTS=2", 1500);
+     uint64_t t = parseQLTS(r);
+     if (t == 0) {
++        setError("Network time sync failed");
+         return false;
+     }
+     unix_base_ms = t;
+@@ -266,9 +440,7 @@
+ 
+ uint64_t TDM2421MQTT::nowUnixMs() const
+ {
+-    if (!time_ok) {
+-        return 0;
+-    }
++    if (!time_ok) return 0;
+     return unix_base_ms + (uint32_t)(millis() - millis_base);
+ }
+ 
+@@ -288,6 +460,8 @@
+ {
+     ODID_UAS_Data uas {};
+     uint8_t wifi_channel = 6;
++    TDM2421Config cfg {};
++    getConfig(cfg);
+ 
+     if (snapshot_mutex == nullptr ||
+         xSemaphoreTake(snapshot_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+@@ -301,9 +475,7 @@
+     wifi_channel = snapshot_wifi_channel;
+     xSemaphoreGive(snapshot_mutex);
+ 
+-    if (!uas.LocationValid) {
+-        return true;
+-    }
++    if (!uas.LocationValid) return true;
+ 
+     const char *uas_sn = "";
+     if (uas.BasicIDValid[0] && strnlen((const char *)uas.BasicID[0].UASID, 20) > 0) {
+@@ -316,7 +488,6 @@
+     const uint64_t ts = nowUnixMs();
+     msg_count++;
+ 
+-    // Keep this buffer comfortably above the expected ~450-byte payload.
+     char payload[1024];
+     const int n = snprintf(
+         payload, sizeof(payload),
+@@ -327,10 +498,10 @@
+         "\"height\":%.2f,\"latitude\":%.15f,\"longitude\":%.15f,"
+         "\"objectId\":\"%s\",\"speed\":%.2f,\"time\":%llu}],"
+         "\"ptTime\":%llu,\"ver\":\"%s\"}",
+-        TDM_DEVICE_ID,
++        cfg.device_id,
+         (unsigned long)msg_count,
+         uas.Location.AltitudeGeo,
+-        TDM_BANDWIDTH,
++        cfg.bandwidth,
+         channel,
+         uas.SystemValid ? uas.System.OperatorLatitude : 0.0,
+         uas.SystemValid ? uas.System.OperatorLongitude : 0.0,
+@@ -342,9 +513,10 @@
+         uas.Location.SpeedHorizontal,
+         (unsigned long long)ts,
+         (unsigned long long)ts,
+-        TDM_VERSION);
++        cfg.version);
+ 
+     if (n <= 0 || n >= (int)sizeof(payload)) {
++        setError("JSON buffer overflow");
+         Serial.println("[MQTT] JSON buffer overflow");
+         return false;
+     }
+@@ -354,40 +526,167 @@
+     if (mqtt_msg_id == 0) mqtt_msg_id = 1;
+ 
+     String cmd = "AT+QMTPUBEX=0," + String(id) + ",1,0,\"" +
+-                 String(TDM_MQTT_TOPIC) + "\"," + String(n);
++                 String(cfg.mqtt_topic) + "\"," + String(n);
+     Serial.printf("[MQTT] publish msgCnt=%lu bytes=%d\n", (unsigned long)msg_count, n);
+     Serial0.println(cmd);
+ 
+     if (!waitFor(">", 5000)) {
+-        mqtt_ok = false;
++        setMQTTState(false);
++        setError("MQTT publish prompt timeout");
+         return false;
+     }
+ 
+     Serial0.write((const uint8_t *)payload, n);
+     const String expected = "+QMTPUBEX: 0," + String(id) + ",0";
+     if (!waitFor(expected, 10000)) {
+-        mqtt_ok = false;
++        setMQTTState(false);
++        setError("MQTT publish acknowledgement failed");
+         return false;
+     }
+ 
++    if (state_mutex && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
++        last_publish_ok_ms = millis();
++        xSemaphoreGive(state_mutex);
++    }
++    setError("");
+     Serial.printf("[MQTT] JSON: %s\n", payload);
+     return true;
+ }
+ 
++void TDM2421MQTT::refreshSignal()
++{
++    String r = sendAT("AT+CSQ", 500);
++    const int p = r.indexOf("+CSQ:");
++    if (p < 0) return;
++    int csq = 99;
++    if (sscanf(r.c_str() + p, "+CSQ: %d", &csq) == 1) {
++        int dbm = 0;
++        if (csq >= 0 && csq <= 31) dbm = -113 + 2 * csq;
++        if (state_mutex && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
++            rssi_dbm = dbm;
++            xSemaphoreGive(state_mutex);
++        }
++    }
++}
++
++void TDM2421MQTT::handleReconfigure()
++{
++    if (!reconfigure_requested) return;
++    reconfigure_requested = false;
++
++    Serial.println("[MQTT] configuration changed; reconnecting LTE/MQTT");
++    sendAT("AT+QMTDISC=0", 800);
++    sendAT("AT+QMTCLOSE=0", 800);
++    sendAT("AT+QIDEACT=1", 5000);
++    setNetworkState(false);
++    setMQTTState(false);
++    time_ok = false;
++    registered = false;
++    setError("Reconfiguring");
++}
++
++String TDM2421MQTT::jsonEscape(const String &s)
++{
++    String out;
++    out.reserve(s.length() + 8);
++    for (size_t i = 0; i < s.length(); i++) {
++        const char c = s[i];
++        if (c == '\\' || c == '"') {
++            out += '\\';
++            out += c;
++        } else if (c == '\n') {
++            out += "\\n";
++        } else if (c != '\r') {
++            out += c;
++        }
++    }
++    return out;
++}
++
++String TDM2421MQTT::configJson()
++{
++    TDM2421Config cfg {};
++    getConfig(cfg);
++    String s = "{";
++    s += "\"apn\":\"" + jsonEscape(cfg.apn) + "\",";
++    s += "\"mqttHost\":\"" + jsonEscape(cfg.mqtt_host) + "\",";
++    s += "\"mqttPort\":" + String(cfg.mqtt_port) + ",";
++    s += "\"mqttUser\":\"" + jsonEscape(cfg.mqtt_user) + "\",";
++    s += "\"mqttClient\":\"" + jsonEscape(cfg.mqtt_client) + "\",";
++    s += "\"mqttTopic\":\"" + jsonEscape(cfg.mqtt_topic) + "\",";
++    s += "\"deviceId\":\"" + jsonEscape(cfg.device_id) + "\",";
++    s += "\"version\":\"" + jsonEscape(cfg.version) + "\",";
++    s += "\"bandwidth\":\"" + jsonEscape(cfg.bandwidth) + "\",";
++    s += "\"publishIntervalMs\":" + String(cfg.publish_interval_ms) + ",";
++    s += "\"reconnectIntervalMs\":" + String(cfg.reconnect_interval_ms) + ",";
++    s += "\"passwordStored\":" + String(strlen(cfg.mqtt_pass) > 0 ? "true" : "false");
++    s += "}";
++    return s;
++}
++
++String TDM2421MQTT::statusJson()
++{
++    bool local_sim = sim_ready;
++    bool local_reg = registered;
++    bool local_net = network_ok;
++    bool local_mqtt = mqtt_ok;
++    bool local_time = time_ok;
++    int local_rssi = rssi_dbm;
++    uint32_t local_last_pub = last_publish_ok_ms;
++    char local_ip[32] {};
++    char local_err[96] {};
++
++    if (state_mutex && xSemaphoreTake(state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
++        local_sim = sim_ready;
++        local_reg = registered;
++        local_net = network_ok;
++        local_mqtt = mqtt_ok;
++        local_time = time_ok;
++        local_rssi = rssi_dbm;
++        local_last_pub = last_publish_ok_ms;
++        copyCString(local_ip, lte_ip);
++        copyCString(local_err, last_error);
++        xSemaphoreGive(state_mutex);
++    }
++
++    TDM2421Config cfg {};
++    getConfig(cfg);
++
++    String s = "{";
++    s += "\"simReady\":" + String(local_sim ? "true" : "false") + ",";
++    s += "\"lteRegistered\":" + String(local_reg ? "true" : "false") + ",";
++    s += "\"pdpActive\":" + String(local_net ? "true" : "false") + ",";
++    s += "\"mqttConnected\":" + String(local_mqtt ? "true" : "false") + ",";
++    s += "\"timeSynced\":" + String(local_time ? "true" : "false") + ",";
++    s += "\"lteIp\":\"" + jsonEscape(local_ip) + "\",";
++    s += "\"rssiDbm\":" + String(local_rssi) + ",";
++    s += "\"msgCnt\":" + String(msg_count) + ",";
++    s += "\"lastPublishAgeMs\":" + String(local_last_pub == 0 ? 0 : (millis() - local_last_pub)) + ",";
++    s += "\"lastError\":\"" + jsonEscape(local_err) + "\",";
++    s += "\"broker\":\"" + jsonEscape(String(cfg.mqtt_host) + ":" + String(cfg.mqtt_port)) + "\",";
++    s += "\"topic\":\"" + jsonEscape(cfg.mqtt_topic) + "\"";
++    s += "}";
++    return s;
++}
++
+ void TDM2421MQTT::task()
+ {
+-    // setup() has already powered EG800K and started Serial0.
+     delay(1000);
+ 
+     uint32_t last_reconnect = 0;
+     uint32_t last_publish = 0;
+     uint32_t last_time_sync = 0;
++    uint32_t last_signal = 0;
+ 
+     for (;;) {
+         const uint32_t now = millis();
++        handleReconfigure();
++
++        TDM2421Config cfg {};
++        getConfig(cfg);
+ 
+         if (!network_ok || !mqtt_ok) {
+-            if (now - last_reconnect >= TDM_RECONNECT_INTERVAL_MS) {
++            if (now - last_reconnect >= cfg.reconnect_interval_ms) {
+                 last_reconnect = now;
+                 if (!modemReady()) {
+                     delay(1000);
+@@ -397,9 +696,7 @@
+                     delay(1000);
+                     continue;
+                 }
+-                if (!time_ok) {
+-                    syncTime();
+-                }
++                if (!time_ok) syncTime();
+                 ensureMQTT();
+             }
+             delay(20);
+@@ -408,12 +705,15 @@
+ 
+         // Re-sync network time hourly.
+         if (!time_ok || now - last_time_sync >= 3600000UL) {
+-            if (syncTime()) {
+-                last_time_sync = now;
+-            }
++            if (syncTime()) last_time_sync = now;
++        }
++
++        if (now - last_signal >= 30000UL) {
++            last_signal = now;
++            refreshSignal();
+         }
+ 
+-        if (now - last_publish >= TDM_PUBLISH_INTERVAL_MS) {
++        if (now - last_publish >= cfg.publish_interval_ms) {
+             last_publish = now;
+             publishSnapshot();
+         }
+--- /mnt/data/arduremoteid_original/arduremoteid/RemoteIDModule/webinterface.cpp	2026-09-10 13:39:31.000000000 +0000
++++ /mnt/data/arduremoteid_mod/arduremoteid/RemoteIDModule/webinterface.cpp	2026-09-13 10:21:11.495416034 +0000
+@@ -10,23 +10,49 @@
+ #include "romfs.h"
+ #include "check_firmware.h"
+ #include "status.h"
++#if defined(BOARD_TDM2421)
++#include "tdm2421_mqtt.h"
++#endif
+ 
+ static WebServer server(80);
+ 
++static String htmlEscape(String s)
++{
++    s.replace("&", "&amp;");
++    s.replace("\"", "&quot;");
++    s.replace("<", "&lt;");
++    s.replace(">", "&gt;");
++    return s;
++}
++
++static String jsonEscape(String s)
++{
++    s.replace("\\", "\\\\");
++    s.replace("\"", "\\\"");
++    s.replace("\n", "\\n");
++    s.replace("\r", "");
++    return s;
++}
++
+ /*
+   serve files from ROMFS
+  */
+ class ROMFS_Handler : public RequestHandler
+ {
+     bool canHandle(HTTPMethod method, String uri) {
++#if defined(BOARD_TDM2421)
++        // On TDM2421 the root path is the new local configuration dashboard.
++        // The original ArduRemoteID page remains available as /index.html.
++        if (uri == "/") {
++            return false;
++        }
++#else
+         if (uri == "/") {
+             uri = "/index.html";
+         }
++#endif
+         uri = "web" + uri;
+-        if (ROMFS::exists(uri.c_str())) {
+-            return true;
+-        }
+-        return false;
++        return ROMFS::exists(uri.c_str());
+     }
+ 
+     bool handle(WebServer& server, HTTPMethod requestMethod, String requestUri) {
+@@ -36,7 +62,6 @@
+         String uri = "web" + requestUri;
+         Serial.printf("handle: '%s'\n", requestUri.c_str());
+ 
+-        // work out content type
+         const char *content_type = "text/html";
+         const struct {
+             const char *extension;
+@@ -67,7 +92,7 @@
+ } ROMFS_Handler;
+ 
+ /*
+-  serve files from ROMFS
++  serve legacy ArduRemoteID AJAX status
+  */
+ class AJAX_Handler : public RequestHandler
+ {
+@@ -85,6 +110,198 @@
+ 
+ } AJAX_Handler;
+ 
++#if defined(BOARD_TDM2421)
++
++static String tdmDashboardHtml()
++{
++    TDM2421Config cfg {};
++    tdm2421_mqtt.getConfig(cfg);
++
++    String h;
++    h.reserve(12000);
++    h += F("<!doctype html><html><head><meta charset='utf-8'>");
++    h += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
++    h += F("<title>TDM2421 Control</title><style>");
++    h += F("body{font-family:Arial,sans-serif;margin:0;background:#f3f5f7;color:#18212b}"
++           ".top{background:#172b4d;color:white;padding:16px 20px}.top h1{margin:0;font-size:24px}"
++           ".wrap{max-width:980px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}"
++           ".card{background:white;border-radius:10px;padding:16px;box-shadow:0 1px 5px #0002;margin-bottom:14px}"
++           ".row{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid #eee;padding:7px 0}.row:last-child{border:0}"
++           ".v{font-family:monospace;text-align:right;word-break:break-all}.ok{color:#16803a;font-weight:bold}.bad{color:#b42318;font-weight:bold}"
++           "label{display:block;font-weight:bold;margin-top:10px}input{width:100%;box-sizing:border-box;padding:9px;border:1px solid #bbb;border-radius:6px}"
++           "button{margin-top:16px;padding:10px 18px;border:0;border-radius:7px;background:#1769aa;color:white;font-weight:bold}"
++           ".note{font-size:13px;color:#59636e}.nav a{color:#dbeafe;margin-right:15px}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}"
++           "@media(max-width:650px){.two{grid-template-columns:1fr}}"
++           "</style></head><body>");
++    h += F("<div class='top'><h1>TDM2421 Local Dashboard</h1><div class='nav'><a href='/'>Status & Config</a><a href='/index.html'>ArduRemoteID Legacy</a><a href='/api/status'>JSON API</a></div></div>");
++    h += F("<div class='wrap'><div class='grid'>");
++
++    h += F("<div class='card'><h3>Wi-Fi AP</h3>"
++           "<div class='row'><span>SSID</span><span class='v' id='ap_ssid'></span></div>"
++           "<div class='row'><span>IP</span><span class='v' id='ap_ip'></span></div>"
++           "<div class='row'><span>Clients</span><span class='v' id='ap_clients'></span></div>"
++           "<div class='row'><span>Channel</span><span class='v' id='ap_channel'></span></div></div>");
++
++    h += F("<div class='card'><h3>EG800K / LTE</h3>"
++           "<div class='row'><span>SIM</span><span class='v' id='sim'></span></div>"
++           "<div class='row'><span>LTE registration</span><span class='v' id='lte_reg'></span></div>"
++           "<div class='row'><span>PDP</span><span class='v' id='pdp'></span></div>"
++           "<div class='row'><span>LTE IP</span><span class='v' id='lte_ip'></span></div>"
++           "<div class='row'><span>RSSI</span><span class='v' id='rssi'></span></div></div>");
++
++    h += F("<div class='card'><h3>MQTT</h3>"
++           "<div class='row'><span>Connected</span><span class='v' id='mqtt'></span></div>"
++           "<div class='row'><span>Broker</span><span class='v' id='broker'></span></div>"
++           "<div class='row'><span>Topic</span><span class='v' id='topic'></span></div>"
++           "<div class='row'><span>Published</span><span class='v' id='msgcnt'></span></div>"
++           "<div class='row'><span>Last publish age</span><span class='v' id='pubage'></span></div>"
++           "<div class='row'><span>Last error</span><span class='v' id='err'></span></div></div>");
++
++    h += F("<div class='card'><h3>UAV / MAVLink / Remote ID</h3>"
++           "<div class='row'><span>Data source</span><span class='v' id='source'></span></div>"
++           "<div class='row'><span>MAVLink</span><span class='v' id='mav'></span></div>"
++           "<div class='row'><span>Latitude</span><span class='v' id='lat'></span></div>"
++           "<div class='row'><span>Longitude</span><span class='v' id='lon'></span></div>"
++           "<div class='row'><span>Altitude Geo</span><span class='v' id='alt'></span></div>"
++           "<div class='row'><span>Speed</span><span class='v' id='speed'></span></div>"
++           "<div class='row'><span>Heading</span><span class='v' id='hdg'></span></div></div>");
++
++    h += F("</div><div class='card'><h2>Configuration</h2><form method='POST' action='/save'>");
++    h += F("<h3>Wi-Fi AP</h3><div class='two'><div><label>SSID</label><input name='ap_ssid' maxlength='20' value='");
++    h += htmlEscape(g.wifi_ssid);
++    h += F("'></div><div><label>Wi-Fi channel</label><input name='ap_channel' type='number' min='1' max='13' value='");
++    h += String(g.wifi_channel);
++    h += F("'></div></div><label>New AP password</label><input name='ap_pass' type='password' minlength='8' maxlength='20' placeholder='Leave blank to keep current password'>");
++
++    h += F("<h3>LTE / MQTT</h3><div class='two'><div><label>APN</label><input name='apn' maxlength='32' value='");
++    h += htmlEscape(cfg.apn);
++    h += F("'></div><div><label>Publish interval (ms)</label><input name='pub_ms' type='number' min='250' max='60000' value='");
++    h += String(cfg.publish_interval_ms);
++    h += F("'></div></div><div class='two'><div><label>MQTT host</label><input name='host' maxlength='64' value='");
++    h += htmlEscape(cfg.mqtt_host);
++    h += F("'></div><div><label>MQTT port</label><input name='port' type='number' min='1' max='65535' value='");
++    h += String(cfg.mqtt_port);
++    h += F("'></div></div><div class='two'><div><label>Username</label><input name='user' maxlength='32' value='");
++    h += htmlEscape(cfg.mqtt_user);
++    h += F("'></div><div><label>New MQTT password</label><input name='pass' type='password' maxlength='64' placeholder='Leave blank to keep current password'></div></div>");
++    h += F("<label>Client ID</label><input name='client' maxlength='64' value='");
++    h += htmlEscape(cfg.mqtt_client);
++    h += F("'><label>Topic</label><input name='topic' maxlength='96' value='");
++    h += htmlEscape(cfg.mqtt_topic);
++    h += F("'><div class='two'><div><label>Device ID</label><input name='device' maxlength='32' value='");
++    h += htmlEscape(cfg.device_id);
++    h += F("'></div><div><label>Reconnect interval (ms)</label><input name='recon_ms' type='number' min='1000' max='300000' value='");
++    h += String(cfg.reconnect_interval_ms);
++    h += F("'></div></div><div class='two'><div><label>Version</label><input name='version' maxlength='16' value='");
++    h += htmlEscape(cfg.version);
++    h += F("'></div><div><label>Bandwidth text</label><input name='bandwidth' maxlength='16' value='");
++    h += htmlEscape(cfg.bandwidth);
++    h += F("'></div></div><button type='submit'>SAVE & REBOOT</button>"
++           "<p class='note'>Passwords are stored in ESP32 NVS and are never returned by the JSON API. Saving restarts the board so Wi-Fi and LTE/MQTT settings are applied cleanly.</p></form></div>");
++
++    h += F("<div class='card'><h3>Notes</h3><p class='note'>The ESP32-C3 AP is also the Wi-Fi interface used by the OpenDroneID beacon/vendor IE. The EG800K continues to provide LTE/MQTT over UART0; this page does not route Internet traffic to connected Wi-Fi clients.</p></div></div>");
++
++    h += F("<script>function yn(v){return v?'<span class=ok>YES</span>':'<span class=bad>NO</span>';}"
++           "function set(id,v){document.getElementById(id).innerHTML=(v===undefined||v===null||v==='')?'-':v;}"
++           "async function poll(){try{let r=await fetch('/api/status',{cache:'no-store'});let j=await r.json();let t=j.tdm||{},q=j.rid||{},a=j.ap||{};"
++           "set('ap_ssid',a.ssid);set('ap_ip',a.ip);set('ap_clients',a.clients);set('ap_channel',a.channel);"
++           "set('sim',yn(t.simReady));set('lte_reg',yn(t.lteRegistered));set('pdp',yn(t.pdpActive));set('lte_ip',t.lteIp);set('rssi',t.rssiDbm? t.rssiDbm+' dBm':'-');"
++           "set('mqtt',yn(t.mqttConnected));set('broker',t.broker);set('topic',t.topic);set('msgcnt',t.msgCnt);set('pubage',t.lastPublishAgeMs? t.lastPublishAgeMs+' ms':'-');set('err',t.lastError);"
++           "set('source',q['STATUS:DATA_SOURCE']);set('mav',q['MAVLINK:Connected']);set('lat',q['LOCATION:Latitude']);set('lon',q['LOCATION:Longitude']);set('alt',q['LOCATION:AltitudeGeo']+' m');set('speed',q['LOCATION:SpeedHorizontal']+' m/s');set('hdg',q['LOCATION:Direction']+' deg');}catch(e){set('err','dashboard poll failed');}}"
++           "poll();setInterval(poll,1000);</script></body></html>");
++    return h;
++}
++
++static void setupTDM2421Routes()
++{
++    server.on("/", HTTP_GET, []() {
++        server.send(200, "text/html", tdmDashboardHtml());
++    });
++    server.on("/tdm2421", HTTP_GET, []() {
++        server.send(200, "text/html", tdmDashboardHtml());
++    });
++    server.on("/api/config", HTTP_GET, []() {
++        String s = "{";
++        s += "\"apSsid\":\"" + jsonEscape(g.wifi_ssid) + "\",";
++        s += "\"apChannel\":" + String(g.wifi_channel) + ",";
++        s += "\"mqtt\":" + tdm2421_mqtt.configJson();
++        s += "}";
++        server.send(200, "application/json", s);
++    });
++    server.on("/api/status", HTTP_GET, []() {
++        String s;
++        s.reserve(4096);
++        s = "{";
++        s += "\"tdm\":" + tdm2421_mqtt.statusJson() + ",";
++        s += "\"rid\":" + status_json() + ",";
++        s += "\"ap\":{";
++        s += "\"ssid\":\"" + jsonEscape(g.wifi_ssid) + "\",";
++        s += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
++        s += "\"clients\":" + String(WiFi.softAPgetStationNum()) + ",";
++        s += "\"channel\":" + String(g.wifi_channel);
++        s += "}}";
++        server.sendHeader("Cache-Control", "no-store");
++        server.send(200, "application/json", s);
++    });
++    server.on("/save", HTTP_POST, []() {
++        TDM2421Config cfg {};
++        tdm2421_mqtt.getConfig(cfg);
++
++        auto argToBuf = [](const String &name, char *dst, size_t len, bool allow_empty=true) {
++            if (!server.hasArg(name)) return;
++            String v = server.arg(name);
++            v.trim();
++            if (!allow_empty && v.length() == 0) return;
++            memset(dst, 0, len);
++            v.substring(0, len - 1).toCharArray(dst, len);
++        };
++
++        argToBuf("apn", cfg.apn, sizeof(cfg.apn), false);
++        argToBuf("host", cfg.mqtt_host, sizeof(cfg.mqtt_host), false);
++        argToBuf("user", cfg.mqtt_user, sizeof(cfg.mqtt_user), true);
++        if (server.hasArg("pass") && server.arg("pass").length() > 0) {
++            argToBuf("pass", cfg.mqtt_pass, sizeof(cfg.mqtt_pass), true);
++        }
++        argToBuf("client", cfg.mqtt_client, sizeof(cfg.mqtt_client), false);
++        argToBuf("topic", cfg.mqtt_topic, sizeof(cfg.mqtt_topic), false);
++        argToBuf("device", cfg.device_id, sizeof(cfg.device_id), false);
++        argToBuf("version", cfg.version, sizeof(cfg.version), false);
++        argToBuf("bandwidth", cfg.bandwidth, sizeof(cfg.bandwidth), false);
++
++        if (server.hasArg("port")) cfg.mqtt_port = (uint16_t)server.arg("port").toInt();
++        if (server.hasArg("pub_ms")) cfg.publish_interval_ms = (uint32_t)server.arg("pub_ms").toInt();
++        if (server.hasArg("recon_ms")) cfg.reconnect_interval_ms = (uint32_t)server.arg("recon_ms").toInt();
++
++        String ap_ssid = server.hasArg("ap_ssid") ? server.arg("ap_ssid") : String(g.wifi_ssid);
++        ap_ssid.trim();
++        const int ap_channel = server.hasArg("ap_channel") ? server.arg("ap_channel").toInt() : g.wifi_channel;
++        const String ap_pass = server.hasArg("ap_pass") ? server.arg("ap_pass") : String();
++
++        if (ap_ssid.length() == 0 || ap_ssid.length() > 20 || ap_channel < 1 || ap_channel > 13 ||
++            (ap_pass.length() > 0 && (ap_pass.length() < 8 || ap_pass.length() > 20))) {
++            server.send(400, "text/plain", "Invalid Wi-Fi AP configuration");
++            return;
++        }
++        if (!tdm2421_mqtt.saveConfig(cfg)) {
++            server.send(400, "text/plain", "Invalid or unsaved LTE/MQTT configuration");
++            return;
++        }
++
++        g.set_by_name_string("WIFI_SSID", ap_ssid.c_str());
++        g.set_by_name_uint8("WIFI_CHANNEL", (uint8_t)ap_channel);
++        if (ap_pass.length() > 0) {
++            g.set_by_name_string("WIFI_PASSWORD", ap_pass.c_str());
++        }
++
++        server.send(200, "text/html",
++                    "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
++                    "<h2>Configuration saved</h2><p>TDM2421 is rebooting. Reconnect to the configured Wi-Fi AP, then open <b>http://192.168.4.1</b>.</p>");
++        delay(800);
++        ESP.restart();
++    });
++}
++#endif
++
+ /*
+   init web server
+  */
+@@ -92,41 +309,43 @@
+ {
+     Serial.printf("WAP start %s %s\n", g.wifi_ssid, g.wifi_password);
+     IPAddress myIP = WiFi.softAPIP();
++    Serial.printf("WAP IP %s\n", myIP.toString().c_str());
++
++#if defined(BOARD_TDM2421)
++    setupTDM2421Routes();
++#endif
+ 
+-    server.addHandler( &AJAX_Handler );
+-    server.addHandler( &ROMFS_Handler );
++    server.addHandler(&AJAX_Handler);
++    server.addHandler(&ROMFS_Handler);
+ 
+-    /*handling uploading firmware file */
++    /* handling uploading firmware file */
+     server.on("/update", HTTP_POST, []() {
+         if (Update.hasError()) {
+-			server.sendHeader("Connection", "close");
+-		    server.send(500, "text/plain","FAIL");
+-		    Serial.printf("Update Failed: Update function has errors\n");
+-		    delay(5000);
+-		} else {
+-			server.sendHeader("Connection", "close");
+-			server.send(200, "text/plain","OK");
+-			Serial.printf("Update Success: \nRebooting...\n");
+-			delay(1000);
+-			ESP.restart();
+-		}
++            server.sendHeader("Connection", "close");
++            server.send(500, "text/plain", "FAIL");
++            Serial.printf("Update Failed: Update function has errors\n");
++            delay(5000);
++        } else {
++            server.sendHeader("Connection", "close");
++            server.send(200, "text/plain", "OK");
++            Serial.printf("Update Success: \nRebooting...\n");
++            delay(1000);
++            ESP.restart();
++        }
+     }, [this]() {
+         HTTPUpload& upload = server.upload();
+-        static const esp_partition_t* partition_new_firmware = esp_ota_get_next_update_partition(NULL); //get OTA partion to which we will write new firmware file;
++        static const esp_partition_t* partition_new_firmware = esp_ota_get_next_update_partition(NULL);
+         if (upload.status == UPLOAD_FILE_START) {
+             Serial.printf("Update: %s\n", upload.filename.c_str());
+             lead_len = 0;
+ 
+-            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
++            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                 Update.printError(Serial);
+             }
+         } else if (upload.status == UPLOAD_FILE_WRITE) {
+-            /* flashing firmware to ESP*/
+             if (lead_len < sizeof(lead_bytes)) {
+                 uint32_t n = sizeof(lead_bytes)-lead_len;
+-                if (n > upload.currentSize) {
+-                    n = upload.currentSize;
+-                }
++                if (n > upload.currentSize) n = upload.currentSize;
+                 memcpy(&lead_bytes[lead_len], upload.buf, n);
+                 lead_len += n;
+             }
+@@ -134,7 +353,6 @@
+                 Update.printError(Serial);
+             }
+         } else if (upload.status == UPLOAD_FILE_END) {
+-            // write extra bytes to force flush of the buffer before we check signature
+             uint32_t extra = SPI_FLASH_SEC_SIZE+1;
+             while (extra--) {
+                 uint8_t ff = 0xff;
+@@ -143,17 +361,17 @@
+             if (!CheckFirmware::check_OTA_next(partition_new_firmware, lead_bytes, lead_len)) {
+                 Serial.printf("Update Failed: firmware checks have errors\n");
+                 server.sendHeader("Connection", "close");
+-                server.send(500, "text/plain","FAIL");
++                server.send(500, "text/plain", "FAIL");
+                 delay(5000);
+             } else if (Update.end(true)) {
+                 Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+                 server.sendHeader("Connection", "close");
+-                server.send(200, "text/plain","OK");
++                server.send(200, "text/plain", "OK");
+             } else {
+                 Update.printError(Serial);
+                 Serial.printf("Update Failed: Update.end function has errors\n");
+                 server.sendHeader("Connection", "close");
+-                server.send(500, "text/plain","FAIL");
++                server.send(500, "text/plain", "FAIL");
+                 delay(5000);
+             }
+         }
+--- /mnt/data/arduremoteid_original/arduremoteid/RemoteIDModule/RemoteIDModule.ino	2026-09-11 07:36:17.000000000 +0000
++++ /mnt/data/arduremoteid_mod/arduremoteid/RemoteIDModule/RemoteIDModule.ino	2026-09-13 10:20:17.475406104 +0000
+@@ -46,6 +46,9 @@
+ // OpenDroneID output data structure
+ ODID_UAS_Data UAS_data;
+ String status_reason;
++String status_data_source = "BOOT";
++bool status_mavlink_connected = false;
++uint32_t status_mavlink_age_ms = 0;
+ static uint32_t last_location_ms;
+ static WebInterface webif;
+ 
+@@ -502,6 +505,14 @@
+ 
+     led.update();
+     status_reason = "RID FAKE TEST";
++    status_data_source = "FAKE_TEST";
++    status_mavlink_connected = false;
++    status_mavlink_age_ms = 0;
++
++    // The local TDM2421 dashboard must also remain responsive in fake-test mode.
++    if (g.webserver_enable) {
++        webif.update();
++    }
+ 
+ #else
+     // Normal mode: receive OpenDroneID data from MAVLink / DroneCAN.
+@@ -528,6 +539,12 @@
+     const uint32_t transport_last_location_ms = transport.get_last_location_ms();
+     const uint32_t last_system_ms = transport.get_last_system_ms();
+ 
++    status_data_source = "MAVLink";
++    status_mavlink_connected = (transport_last_location_ms != 0 &&
++                                now_ms - transport_last_location_ms <= 5000);
++    status_mavlink_age_ms = transport_last_location_ms == 0 ? 0 :
++                            now_ms - transport_last_location_ms;
++
+     led.update();
+     status_reason = "";
+ 
+--- /mnt/data/arduremoteid_original/arduremoteid/RemoteIDModule/status.cpp	2026-09-10 13:39:31.000000000 +0000
++++ /mnt/data/arduremoteid_mod/arduremoteid/RemoteIDModule/status.cpp	2026-09-13 10:20:17.475481146 +0000
+@@ -10,6 +10,9 @@
+ 
+ extern ODID_UAS_Data UAS_data;
+ extern String status_reason;
++extern String status_data_source;
++extern bool status_mavlink_connected;
++extern uint32_t status_mavlink_age_ms;
+ 
+ typedef struct {
+     String name;
+@@ -239,6 +242,9 @@
+         { "STATUS:BOARD_ID", String(BOARD_ID)},
+         { "STATUS:UPTIME", String(hr) + ":" + String(minsec_str) },
+         { "STATUS:FREEMEM", String(ESP.getFreeHeap()) },
++        { "STATUS:DATA_SOURCE", status_data_source },
++        { "MAVLINK:Connected", status_mavlink_connected ? "YES" : "NO" },
++        { "MAVLINK:LocationAgeMs", String(status_mavlink_age_ms) },
+         { "BASICID:UAType", ENUM_MAP(uatype, UAS_data.BasicID[0].UAType) },
+         { "BASICID:IDType", ENUM_MAP(idtype, UAS_data.BasicID[0].IDType) },
+         { "BASICID:UASID", String(UAS_data.BasicID[0].UASID) },
+--- /mnt/data/arduremoteid_original/arduremoteid/RemoteIDModule/parameters.h	2026-09-11 04:02:24.000000000 +0000
++++ /mnt/data/arduremoteid_mod/arduremoteid/RemoteIDModule/parameters.h	2026-09-13 10:20:17.475229652 +0000
+@@ -36,8 +36,15 @@
+     uint8_t done_init;
+     uint8_t webserver_enable;
+     uint8_t mavlink_sysid;
++#if defined(BOARD_TDM2421)
++    // The TDM2421 uses the same ESP32-C3 AP interface for the local
++    // configuration dashboard and for the OpenDroneID Wi-Fi beacon IE.
++    char wifi_ssid[21] = "TDM2421_Config";
++    char wifi_password[21] = "tdm2421@123";
++#else
+     char wifi_ssid[21] = "";
+     char wifi_password[21] = "ArduRemoteID";
++#endif
+     uint8_t wifi_channel = 6;
+     uint8_t to_factory_defaults = 0;
+     uint8_t options;

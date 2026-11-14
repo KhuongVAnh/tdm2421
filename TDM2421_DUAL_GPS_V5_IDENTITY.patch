@@ -1,0 +1,163 @@
+diff -ruN v4orig/arduremoteid/RemoteIDModule/tdm2421_mqtt.cpp v5work/arduremoteid/RemoteIDModule/tdm2421_mqtt.cpp
+--- v4orig/arduremoteid/RemoteIDModule/tdm2421_mqtt.cpp	2026-09-15 03:19:34.000000000 +0000
++++ v5work/arduremoteid/RemoteIDModule/tdm2421_mqtt.cpp	2026-09-15 03:57:34.268522827 +0000
+@@ -63,6 +63,7 @@
+     copyCString(cfg.mqtt_client, DEFAULT_MQTT_CLIENT);
+     copyCString(cfg.mqtt_topic, DEFAULT_MQTT_TOPIC);
+     copyCString(cfg.device_id, DEFAULT_DEVICE_ID);
++    cfg.uav_serial[0] = '\0';
+     copyCString(cfg.version, DEFAULT_VERSION);
+     copyCString(cfg.bandwidth, DEFAULT_BANDWIDTH);
+     cfg.publish_interval_ms = DEFAULT_PUBLISH_INTERVAL_MS;
+@@ -78,6 +79,7 @@
+         copyString(cfg.mqtt_client, prefs.getString("client", cfg.mqtt_client));
+         copyString(cfg.mqtt_topic, prefs.getString("topic", cfg.mqtt_topic));
+         copyString(cfg.device_id, prefs.getString("device", cfg.device_id));
++        copyString(cfg.uav_serial, prefs.getString("uavserial", cfg.uav_serial));
+         copyString(cfg.version, prefs.getString("version", cfg.version));
+         copyString(cfg.bandwidth, prefs.getString("bandwidth", cfg.bandwidth));
+         cfg.publish_interval_ms = prefs.getUInt("pub_ms", cfg.publish_interval_ms);
+@@ -92,6 +94,7 @@
+         prefs.putString("client", cfg.mqtt_client);
+         prefs.putString("topic", cfg.mqtt_topic);
+         prefs.putString("device", cfg.device_id);
++        prefs.putString("uavserial", cfg.uav_serial);
+         prefs.putString("version", cfg.version);
+         prefs.putString("bandwidth", cfg.bandwidth);
+         prefs.putUInt("pub_ms", cfg.publish_interval_ms);
+@@ -144,6 +147,7 @@
+     prefs.putString("client", cfg.mqtt_client);
+     prefs.putString("topic", cfg.mqtt_topic);
+     prefs.putString("device", cfg.device_id);
++    prefs.putString("uavserial", cfg.uav_serial);
+     prefs.putString("version", cfg.version);
+     prefs.putString("bandwidth", cfg.bandwidth);
+     prefs.putUInt("pub_ms", cfg.publish_interval_ms);
+@@ -701,10 +705,16 @@
+ 
+     if (!uas.LocationValid) return true;
+ 
+-    const char *uas_sn = "";
++    // Identity policy:
++    //   objectId: valid OpenDroneID Basic ID first, Device ID as a guaranteed fallback.
++    //   uavSN: explicit dashboard UAV Serial first, then Basic ID, then Device ID.
++    // This keeps objectId non-empty even when the Pixhawk has not supplied Basic ID yet.
++    const char *basic_id = "";
+     if (uas.BasicIDValid[0] && strnlen((const char *)uas.BasicID[0].UASID, 20) > 0) {
+-        uas_sn = (const char *)uas.BasicID[0].UASID;
++        basic_id = (const char *)uas.BasicID[0].UASID;
+     }
++    const char *object_id = basic_id[0] ? basic_id : cfg.device_id;
++    const char *uas_sn = cfg.uav_serial[0] ? cfg.uav_serial : object_id;
+ 
+     char channel[20];
+     wifiChannelString(wifi_channel, channel, sizeof(channel));
+@@ -733,7 +743,7 @@
+         uas.Location.Height,
+         uas.Location.Latitude,
+         uas.Location.Longitude,
+-        uas_sn,
++        object_id,
+         uas.Location.SpeedHorizontal,
+         (unsigned long long)ts,
+         (unsigned long long)ts,
+@@ -839,6 +849,7 @@
+     s += "\"mqttClient\":\"" + jsonEscape(cfg.mqtt_client) + "\",";
+     s += "\"mqttTopic\":\"" + jsonEscape(cfg.mqtt_topic) + "\",";
+     s += "\"deviceId\":\"" + jsonEscape(cfg.device_id) + "\",";
++    s += "\"uavSerial\":\"" + jsonEscape(cfg.uav_serial) + "\",";
+     s += "\"version\":\"" + jsonEscape(cfg.version) + "\",";
+     s += "\"bandwidth\":\"" + jsonEscape(cfg.bandwidth) + "\",";
+     s += "\"publishIntervalMs\":" + String(cfg.publish_interval_ms) + ",";
+@@ -889,6 +900,8 @@
+     s += "\"lastError\":\"" + jsonEscape(local_err) + "\",";
+     s += "\"broker\":\"" + jsonEscape(String(cfg.mqtt_host) + ":" + String(cfg.mqtt_port)) + "\",";
+     s += "\"topic\":\"" + jsonEscape(cfg.mqtt_topic) + "\",";
++    s += "\"deviceId\":\"" + jsonEscape(cfg.device_id) + "\",";
++    s += "\"uavSerial\":\"" + jsonEscape(cfg.uav_serial) + "\",";
+     TDM2421GNSSFix gf {};
+     const bool gv = getGNSSFix(gf, 10000);
+     s += "\"gnssValid\":" + String(gv ? "true" : "false") + ",";
+diff -ruN v4orig/arduremoteid/RemoteIDModule/tdm2421_mqtt.h v5work/arduremoteid/RemoteIDModule/tdm2421_mqtt.h
+--- v4orig/arduremoteid/RemoteIDModule/tdm2421_mqtt.h	2026-09-15 03:19:12.000000000 +0000
++++ v5work/arduremoteid/RemoteIDModule/tdm2421_mqtt.h	2026-09-15 03:57:10.610677516 +0000
+@@ -34,6 +34,9 @@
+     char mqtt_client[65];
+     char mqtt_topic[97];
+     char device_id[33];
++    // Optional physical UAV serial used in MQTT extension.uavSN.
++    // Remote ID Basic ID itself is stored in the standard ArduRemoteID UAS_ID parameter.
++    char uav_serial[21];
+     char version[17];
+     char bandwidth[17];
+     uint32_t publish_interval_ms;
+diff -ruN v4orig/arduremoteid/RemoteIDModule/webinterface.cpp v5work/arduremoteid/RemoteIDModule/webinterface.cpp
+--- v4orig/arduremoteid/RemoteIDModule/webinterface.cpp	2026-09-15 03:19:24.000000000 +0000
++++ v5work/arduremoteid/RemoteIDModule/webinterface.cpp	2026-09-15 03:57:34.268909041 +0000
+@@ -176,6 +176,12 @@
+     h += F("<div class='card'><h3>UAV / MAVLink / Remote ID</h3>"
+            "<div class='row'><span>Data source</span><span class='v' id='source'></span></div>"
+            "<div class='row'><span>MAVLink</span><span class='v' id='mav'></span></div>"
++           "<div class='row'><span>Object ID</span><span class='v' id='object_id'></span></div>"
++           "<div class='row'><span>Basic ID / UAS ID</span><span class='v' id='basic_id'></span></div>"
++           "<div class='row'><span>Basic ID type</span><span class='v' id='basic_type'></span></div>"
++           "<div class='row'><span>Basic ID source</span><span class='v' id='basic_source'></span></div>"
++           "<div class='row'><span>UAV Serial</span><span class='v' id='uav_serial'></span></div>"
++           "<div class='row'><span>Device ID</span><span class='v' id='device_id'></span></div>"
+            "<div class='row'><span>Latitude</span><span class='v' id='lat'></span></div>"
+            "<div class='row'><span>Longitude</span><span class='v' id='lon'></span></div>"
+            "<div class='row'><span>Altitude Geo</span><span class='v' id='alt'></span></div>"
+@@ -189,6 +195,12 @@
+     h += String(g.wifi_channel);
+     h += F("'></div></div><label>New AP password</label><input name='ap_pass' type='password' minlength='8' maxlength='20' placeholder='Leave blank to keep current password'>");
+ 
++    h += F("<h3>Remote ID Identity</h3><div class='two'><div><label>Basic ID / UAS ID</label><input name='basic_id' maxlength='20' value='");
++    h += htmlEscape(g.uas_id);
++    h += F("'></div><div><label>UAV Serial</label><input name='uav_serial' maxlength='20' value='");
++    h += htmlEscape(cfg.uav_serial);
++    h += F("'></div></div><p class='note'>Basic ID is the OpenDroneID identity broadcast over Wi-Fi/BLE. Saving a non-empty Basic ID configures UAS_TYPE=multirotor and UAS_ID_TYPE=serial number. MQTT objectId uses Basic ID first and falls back to Device ID. UAV Serial is used for extension.uavSN.</p>");
++
+     h += F("<h3>LTE / MQTT</h3><div class='two'><div><label>APN</label><input name='apn' maxlength='32' value='");
+     h += htmlEscape(cfg.apn);
+     h += F("'></div><div><label>Publish interval (ms)</label><input name='pub_ms' type='number' min='250' max='60000' value='");
+@@ -223,7 +235,7 @@
+            "set('ap_ssid',a.ssid);set('ap_ip',a.ip);set('ap_clients',a.clients);set('ap_channel',a.channel);"
+            "set('sim',yn(t.simReady));set('lte_reg',yn(t.lteRegistered));set('pdp',yn(t.pdpActive));set('lte_ip',t.lteIp);set('rssi',t.rssiDbm? t.rssiDbm+' dBm':'-');set('gnss_engine',yn(t.gnssEngineRunning));set('gnss',yn(t.gnssValid));set('gnss_fix',t.gnssFixText);set('gnss_sat',t.gnssSatellites);set('gnss_used',t.gnssDopValid?t.gnssSatellitesUsed:'N/A');set('gnss_hdop',t.gnssHdop);set('gnss_vdop',t.gnssDopValid?t.gnssVdop:'N/A');set('gnss_pdop',t.gnssDopValid?t.gnssPdop:'N/A');set('gnss_utc',t.gnssUtc);set('gnss_date',t.gnssDate);set('gnss_age',t.gnssAgeMs+' ms');set('gnss_lat',t.gnssLat);set('gnss_lon',t.gnssLon);set('gnss_alt',t.gnssAlt+' m');set('gnss_speed',t.gnssSpeed+' m/s');set('gnss_course',t.gnssCourseValid?t.gnssCourse+' deg':'N/A');"
+            "set('mqtt',yn(t.mqttConnected));set('broker',t.broker);set('topic',t.topic);set('msgcnt',t.msgCnt);set('pubage',t.lastPublishAgeMs? t.lastPublishAgeMs+' ms':'-');set('err',t.lastError);"
+-           "set('source',q['STATUS:DATA_SOURCE']);set('mav',q['MAVLINK:Connected']);set('lat',q['LOCATION:Latitude']);set('lon',q['LOCATION:Longitude']);set('alt',q['LOCATION:AltitudeGeo']+' m');set('speed',q['LOCATION:SpeedHorizontal']+' m/s');set('hdg',q['LOCATION:Direction']+' deg');}catch(e){set('err','dashboard poll failed');}}"
++           "set('source',q['STATUS:DATA_SOURCE']);set('mav',q['MAVLINK:Connected']);let bid=q['BASICID:UASID']||'';set('basic_id',bid||'N/A');set('basic_type',q['BASICID:IDType']||'N/A');set('basic_source',bid?'OpenDroneID Basic ID':'Device ID fallback');set('device_id',t.deviceId);set('uav_serial',t.uavSerial||bid||t.deviceId);set('object_id',bid||t.deviceId);set('lat',q['LOCATION:Latitude']);set('lon',q['LOCATION:Longitude']);set('alt',q['LOCATION:AltitudeGeo']+' m');set('speed',q['LOCATION:SpeedHorizontal']+' m/s');set('hdg',q['LOCATION:Direction']+' deg');}catch(e){set('err','dashboard poll failed');}}"
+            "poll();setInterval(poll,1000);</script></body></html>");
+     return h;
+ }
+@@ -281,6 +293,7 @@
+         argToBuf("client", cfg.mqtt_client, sizeof(cfg.mqtt_client), false);
+         argToBuf("topic", cfg.mqtt_topic, sizeof(cfg.mqtt_topic), false);
+         argToBuf("device", cfg.device_id, sizeof(cfg.device_id), false);
++        argToBuf("uav_serial", cfg.uav_serial, sizeof(cfg.uav_serial), true);
+         argToBuf("version", cfg.version, sizeof(cfg.version), false);
+         argToBuf("bandwidth", cfg.bandwidth, sizeof(cfg.bandwidth), false);
+ 
+@@ -303,6 +316,23 @@
+             return;
+         }
+ 
++        // Configure the actual OpenDroneID Basic ID from the local dashboard.
++        // For this TDM2421 build the aircraft is a multirotor and the configured
++        // identifier is treated as a serial-number Basic ID.
++        if (server.hasArg("basic_id")) {
++            String bid = server.arg("basic_id");
++            bid.trim();
++            if (bid.length() > 20) {
++                server.send(400, "text/plain", "Basic ID must be at most 20 characters");
++                return;
++            }
++            if (bid.length() > 0) {
++                g.set_by_name_uint8("UAS_TYPE", ODID_UATYPE_HELICOPTER_OR_MULTIROTOR);
++                g.set_by_name_uint8("UAS_ID_TYPE", ODID_IDTYPE_SERIAL_NUMBER);
++                g.set_by_name_string("UAS_ID", bid.c_str());
++            }
++        }
++
+         g.set_by_name_string("WIFI_SSID", ap_ssid.c_str());
+         g.set_by_name_uint8("WIFI_CHANNEL", (uint8_t)ap_channel);
+         if (ap_pass.length() > 0) {

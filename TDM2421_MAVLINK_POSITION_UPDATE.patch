@@ -1,0 +1,209 @@
+--- /tmp/orig_mavlink.cpp	2026-09-17 00:16:08.671936408 +0000
++++ RemoteIDModule/mavlink.cpp	2026-09-17 00:15:55.743525251 +0000
+@@ -9,6 +9,42 @@
+ 
+ #define SERIAL_BAUD 115200
+ 
++// TDM2421/Pixhawk position-source policy:
++//   1. Native OPEN_DRONE_ID_LOCATION (original ArduRemoteID behaviour)
++//   2. GLOBAL_POSITION_INT converted to an OpenDroneID location
++//   3. GPS_RAW_INT converted to an OpenDroneID location
++// Native OpenDroneID data always wins while it is fresh. GLOBAL_POSITION_INT
++// wins over GPS_RAW_INT while it is fresh. EG800K fallback remains in the
++// main loop and is used only when no MAVLink location has been received for 5 s.
++static uint32_t last_native_odid_location_ms;
++static uint32_t last_global_position_ms;
++static uint32_t last_gps_raw_ms;
++static uint32_t last_mav_rx_report_ms;
++static uint32_t mav_rx_frames;
++static uint32_t mav_rx_bytes;
++
++static float mav_location_timestamp(uint32_t now_ms)
++{
++    // OPEN_DRONE_ID_LOCATION requires seconds after the full hour.  Standard
++    // position messages do not carry UTC seconds-after-hour, so use a monotonic
++    // seconds-after-hour value. Keep it non-zero because set_data() uses zero as
++    // the invalid/uninitialised sentinel.
++    float ts = (now_ms % 3600000UL) * 0.001f;
++    return ts > 0.0f ? ts : 0.001f;
++}
++
++static uint16_t mav_direction_from_cdeg(uint16_t hdg)
++{
++    // GLOBAL_POSITION_INT uses UINT16_MAX when heading is unknown.
++    return hdg == UINT16_MAX ? 36100U : hdg;
++}
++
++static uint16_t mav_speed_horizontal_cms(int16_t vx, int16_t vy)
++{
++    const float speed = sqrtf(float(vx) * float(vx) + float(vy) * float(vy));
++    return (uint16_t)constrain(speed, 0.0f, 25425.0f);
++}
++
+ static HardwareSerial *serial_ports[MAVLINK_COMM_NUM_BUFFERS];
+ 
+ #include <generated/mavlink_helpers.h>
+@@ -103,13 +139,31 @@
+     status.packet_rx_drop_count = 0;
+ 
+     const uint16_t nbytes = serial.available();
++    mav_rx_bytes += nbytes;
+     for (uint16_t i=0; i<nbytes; i++) {
+         const uint8_t c = (uint8_t)serial.read();
+         // Try to get a new message
+         if (mavlink_parse_char(chan, c, &msg, &status)) {
++            mav_rx_frames++;
+             process_packet(status, msg);
+         }
+     }
++
++#if defined(BOARD_TDM2421)
++    const uint32_t now_ms = millis();
++    if ((mav_rx_bytes > 0 || mav_rx_frames > 0) &&
++        now_ms - last_mav_rx_report_ms >= 2000) {
++        last_mav_rx_report_ms = now_ms;
++        Serial.printf("[MAV RX] bytes=%lu frames=%lu sysid=%u age_location=%lu ms\n",
++                      (unsigned long)mav_rx_bytes,
++                      (unsigned long)mav_rx_frames,
++                      (unsigned)mavlink_system.sysid,
++                      last_location_ms == 0 ? 0UL :
++                      (unsigned long)(now_ms - last_location_ms));
++        mav_rx_bytes = 0;
++        mav_rx_frames = 0;
++    }
++#endif
+ }
+ 
+ /*
+@@ -143,18 +197,128 @@
+         break;
+     }
+     case MAVLINK_MSG_ID_OPEN_DRONE_ID_LOCATION: {
++        // Highest priority: preserve the original ArduRemoteID behaviour.
++        // When the autopilot sends a native OpenDroneID Location message, use
++        // its RID fields directly instead of rebuilding them from generic GPS.
+         mavlink_msg_open_drone_id_location_decode(&msg, &location);
++        last_native_odid_location_ms = now_ms;
+         if (g.options & OPTIONS_PRINT_RID_MAVLINK) {
+-            Serial.printf("MAVLink: got Location\n");
++            Serial.printf("[MAV RX] OPEN_DRONE_ID_LOCATION lat=%.7f lon=%.7f alt=%.1f h=%.1f speed=%.2f\n",
++                          location.latitude * 1.0e-7,
++                          location.longitude * 1.0e-7,
++                          location.altitude_geodetic,
++                          location.height,
++                          location.speed_horizontal * 0.01f);
+         }
+         if (last_location_timestamp != location.timestamp) {
+-            //only update the timestamp if we receive information with a different timestamp
+-            last_location_ms = millis();
+             last_location_timestamp = location.timestamp;
+         }
+         last_location_ms = now_ms;
+         break;
+     }
++    case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: {
++        // Generic MAVLink position fallback. Do not overwrite a fresh native
++        // OPEN_DRONE_ID_LOCATION message from the autopilot.
++        if (last_native_odid_location_ms != 0 &&
++            now_ms - last_native_odid_location_ms <= 2000) {
++            break;
++        }
++
++        mavlink_global_position_int_t p;
++        mavlink_msg_global_position_int_decode(&msg, &p);
++        if (p.lat == 0 && p.lon == 0) {
++            break;
++        }
++
++        memset(&location, 0, sizeof(location));
++        location.target_system = 0;
++        location.target_component = 0;
++        location.status = MAV_ODID_STATUS_AIRBORNE;
++        location.direction = mav_direction_from_cdeg(p.hdg);
++        location.speed_horizontal = mav_speed_horizontal_cms(p.vx, p.vy);
++        // GLOBAL_POSITION_INT vz is positive down; OpenDroneID is positive up.
++        location.speed_vertical = (int16_t)constrain(-(int32_t)p.vz, -6200L, 6200L);
++        location.latitude = p.lat;
++        location.longitude = p.lon;
++        location.altitude_geodetic = p.alt * 0.001f;
++        // GLOBAL_POSITION_INT does not provide a separate barometric altitude.
++        // Use the best MAVLink altitude available rather than an invalid sentinel.
++        location.altitude_barometric = location.altitude_geodetic;
++        location.height_reference = MAV_ODID_HEIGHT_REF_OVER_TAKEOFF;
++        location.height = p.relative_alt * 0.001f;
++        location.horizontal_accuracy = MAV_ODID_HOR_ACC_UNKNOWN;
++        location.vertical_accuracy = MAV_ODID_VER_ACC_UNKNOWN;
++        location.barometer_accuracy = MAV_ODID_VER_ACC_UNKNOWN;
++        location.speed_accuracy = MAV_ODID_SPEED_ACC_UNKNOWN;
++        location.timestamp = mav_location_timestamp(now_ms);
++        location.timestamp_accuracy = MAV_ODID_TIME_ACC_UNKNOWN;
++
++        last_global_position_ms = now_ms;
++        last_location_ms = now_ms;
++        last_location_timestamp = location.timestamp;
++
++#if defined(BOARD_TDM2421)
++        Serial.printf("[MAV RX] GLOBAL_POSITION_INT lat=%.7f lon=%.7f alt=%.1f rel=%.1f speed=%.2f hdg=%.1f\n",
++                      location.latitude * 1.0e-7,
++                      location.longitude * 1.0e-7,
++                      location.altitude_geodetic, location.height,
++                      location.speed_horizontal * 0.01f,
++                      location.direction <= 35999 ? location.direction * 0.01f : -1.0f);
++#endif
++        break;
++    }
++    case MAVLINK_MSG_ID_GPS_RAW_INT: {
++        // Last-resort MAVLink GPS source. Prefer native OpenDroneID and
++        // GLOBAL_POSITION_INT whenever either is fresh.
++        if ((last_native_odid_location_ms != 0 &&
++             now_ms - last_native_odid_location_ms <= 2000) ||
++            (last_global_position_ms != 0 &&
++             now_ms - last_global_position_ms <= 2000)) {
++            break;
++        }
++
++        mavlink_gps_raw_int_t p;
++        mavlink_msg_gps_raw_int_decode(&msg, &p);
++        if (p.fix_type < 2 || (p.lat == 0 && p.lon == 0)) {
++            break;
++        }
++
++        memset(&location, 0, sizeof(location));
++        location.target_system = 0;
++        location.target_component = 0;
++        location.status = MAV_ODID_STATUS_AIRBORNE;
++        location.direction = p.cog == UINT16_MAX ? 36100U : p.cog;
++        location.speed_horizontal = p.vel == UINT16_MAX ? 25500U :
++                                    (uint16_t)constrain((uint32_t)p.vel, 0UL, 25425UL);
++        location.speed_vertical = 6300; // unknown in GPS_RAW_INT
++        location.latitude = p.lat;
++        location.longitude = p.lon;
++        location.altitude_geodetic = p.alt * 0.001f;
++        location.altitude_barometric = location.altitude_geodetic;
++        location.height_reference = MAV_ODID_HEIGHT_REF_OVER_TAKEOFF;
++        location.height = -1000.0f; // GPS_RAW_INT has no relative/takeoff height
++        location.horizontal_accuracy = MAV_ODID_HOR_ACC_UNKNOWN;
++        location.vertical_accuracy = MAV_ODID_VER_ACC_UNKNOWN;
++        location.barometer_accuracy = MAV_ODID_VER_ACC_UNKNOWN;
++        location.speed_accuracy = MAV_ODID_SPEED_ACC_UNKNOWN;
++        location.timestamp = mav_location_timestamp(now_ms);
++        location.timestamp_accuracy = MAV_ODID_TIME_ACC_UNKNOWN;
++
++        last_gps_raw_ms = now_ms;
++        last_location_ms = now_ms;
++        last_location_timestamp = location.timestamp;
++
++#if defined(BOARD_TDM2421)
++        Serial.printf("[MAV RX] GPS_RAW_INT fix=%u sats=%u lat=%.7f lon=%.7f alt=%.1f speed=%.2f\n",
++                      (unsigned)p.fix_type, (unsigned)p.satellites_visible,
++                      location.latitude * 1.0e-7,
++                      location.longitude * 1.0e-7,
++                      location.altitude_geodetic,
++                      location.speed_horizontal == 25500U ? -1.0f :
++                      location.speed_horizontal * 0.01f);
++#endif
++        break;
++    }
+     case MAVLINK_MSG_ID_OPEN_DRONE_ID_BASIC_ID: {
+         mavlink_open_drone_id_basic_id_t basic_id_tmp;
+         if (g.options & OPTIONS_PRINT_RID_MAVLINK) {

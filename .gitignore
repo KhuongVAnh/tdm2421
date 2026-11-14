@@ -1,0 +1,32 @@
+# Thư mục và file sinh ra trong quá trình build firmware
+RemoteIDModule/build/
+RemoteIDModule/build-*/
+RemoteIDModule/*.bin
+RemoteIDModule/*.elf
+RemoteIDModule/*.map
+RemoteIDModule/romfs_files.h
+RemoteIDModule/git-version.h
+libraries/mavlink2/generated/
+libraries/DroneCAN_generated/
+*.o
+*.d
+*.a
+
+# Công cụ arduino-cli tải về khi setup môi trường
+arduino-cli_*.tar.gz
+bin/
+
+# File cấu hình IntelliSense cục bộ (chứa đường dẫn riêng của máy) và cache VS Code
+.vscode/c_cpp_properties.json
+.vscode/.browse.c_cpp.db*
+.vscode/ipch/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# File rác của Windows / WSL / macOS
+*:Zone.Identifier
+.DS_Store
+Thumbs.db
