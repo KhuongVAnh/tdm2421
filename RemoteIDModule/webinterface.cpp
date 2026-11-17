@@ -12,6 +12,7 @@
 #include "status.h"
 #if defined(BOARD_TDM2421)
 #include "tdm2421_mqtt.h"
+#include "tdm2421_gps.h"
 #endif
 
 static WebServer server(80);
@@ -118,7 +119,7 @@ static String tdmDashboardHtml()
     tdm2421_mqtt.getConfig(cfg);
 
     String h;
-    h.reserve(12000);
+    h.reserve(18000);
     h += F("<!doctype html><html><head><meta charset='utf-8'>");
     h += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
     h += F("<title>TDM2421 Control</title><style>");
@@ -128,8 +129,11 @@ static String tdmDashboardHtml()
            ".card{background:white;border-radius:10px;padding:16px;box-shadow:0 1px 5px #0002;margin-bottom:14px}"
            ".row{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid #eee;padding:7px 0}.row:last-child{border:0}"
            ".v{font-family:monospace;text-align:right;word-break:break-all}.ok{color:#16803a;font-weight:bold}.bad{color:#b42318;font-weight:bold}"
-           "label{display:block;font-weight:bold;margin-top:10px}input{width:100%;box-sizing:border-box;padding:9px;border:1px solid #bbb;border-radius:6px}"
-           "button{margin-top:16px;padding:10px 18px;border:0;border-radius:7px;background:#1769aa;color:white;font-weight:bold}"
+           "label{display:block;font-weight:bold;margin-top:10px}input,select{width:100%;box-sizing:border-box;padding:9px;border:1px solid #bbb;border-radius:6px}"
+           "button{margin-top:16px;padding:10px 18px;border:0;border-radius:7px;background:#1769aa;color:white;font-weight:bold;cursor:pointer}"
+           "button:disabled{opacity:0.6;cursor:wait}"
+           ".btn-sec{background:#0f766e}.btn-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}"
+           "pre.gpsbox{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:6px;font-size:12px;overflow:auto;max-height:220px;white-space:pre-wrap;margin-top:10px}"
            ".note{font-size:13px;color:#59636e}.nav a{color:#dbeafe;margin-right:15px}.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}"
            "@media(max-width:650px){.two{grid-template-columns:1fr}}"
            "</style></head><body>");
@@ -186,9 +190,45 @@ static String tdmDashboardHtml()
            "<div class='row'><span>Longitude</span><span class='v' id='lon'></span></div>"
            "<div class='row'><span>Altitude Geo</span><span class='v' id='alt'></span></div>"
            "<div class='row'><span>Speed</span><span class='v' id='speed'></span></div>"
-           "<div class='row'><span>Heading</span><span class='v' id='hdg'></span></div></div>");
+           "<div class='row'><span>Heading</span><span class='v' id='hdg'></span></div></div></div>");
 
-    h += F("</div><div class='card'><h2>Configuration</h2><form method='POST' action='/save'>");
+#if TDM2421_USE_EXT_GPS
+    // Thẻ điều khiển & giám sát riêng cho module GPS ngoài trên Serial1 (GPIO 4/5).
+    h += F("<div class='card'><h3>Module GPS Ngoài (Serial1 - GPIO 4/5)</h3>"
+           "<div class='two'><div>"
+           "<div class='row'><span>Trạng thái kết nối</span><span class='v' id='extgps_conn'></span></div>"
+           "<div class='row'><span>Tần số cấu hình</span><span class='v' id='extgps_cfg_hz'></span></div>"
+           "<div class='row'><span>Tần số thực tế</span><span class='v' id='extgps_meas_hz'></span></div>"
+           "<div class='row'><span>Tuổi gói NMEA</span><span class='v' id='extgps_age'></span></div>"
+           "<div class='row'><span>Fix / Vệ tinh</span><span class='v' id='extgps_fix'></span></div>"
+           "</div><div>"
+           "<div class='row'><span>Latitude</span><span class='v' id='extgps_lat'></span></div>"
+           "<div class='row'><span>Longitude</span><span class='v' id='extgps_lon'></span></div>"
+           "<div class='row'><span>Altitude</span><span class='v' id='extgps_alt'></span></div>"
+           "<div class='row'><span>Speed</span><span class='v' id='extgps_spd'></span></div>"
+           "<div class='row'><span>HDOP</span><span class='v' id='extgps_hdop'></span></div>"
+           "</div></div>"
+           "<div class='two' style='margin-top:12px;align-items:end'><div>"
+           "<label>Tần số tính toán GPS</label>"
+           "<select id='extgps_rate_sel'>");
+    const uint8_t cur_hz = tdm2421_gps.getConfiguredHz();
+    h += String("<option value='1'") + (cur_hz == 1 ? " selected" : "") + ">1 Hz (1000 ms)</option>";
+    h += String("<option value='5'") + (cur_hz == 5 ? " selected" : "") + ">5 Hz (200 ms)</option>";
+    h += String("<option value='10'") + (cur_hz == 10 ? " selected" : "") + ">10 Hz (100 ms)</option>";
+    h += F("</select></div>"
+           "<div class='btn-row'>"
+           "<button type='button' onclick='applyGpsRate()'>Áp dụng tần số</button>"
+           "<button type='button' class='btn-sec' id='btn_gps_test' onclick='runGpsTest()'>Test module (1s)</button>"
+           "</div></div>"
+           "<p class='note' id='extgps_msg'></p>"
+           "<div id='extgps_test_box' style='display:none;margin-top:10px'>"
+           "<strong>Kết quả thu từ module GPS trong 1 giây:</strong>"
+           "<div class='row'><span>Kết nối / Tần số đo được</span><span class='v' id='test_summary'></span></div>"
+           "<div class='row'><span>Dữ liệu giải mã</span><span class='v' id='test_fix'></span></div>"
+           "<pre class='gpsbox' id='test_samples'></pre></div></div>");
+#endif
+
+    h += F("<div class='card'><h2>Configuration</h2><form method='POST' action='/save'>");
     h += F("<h3>Wi-Fi AP</h3><div class='two'><div><label>SSID</label><input name='ap_ssid' maxlength='20' value='");
     h += htmlEscape(g.wifi_ssid);
     h += F("'></div><div><label>Wi-Fi channel</label><input name='ap_channel' type='number' min='1' max='13' value='");
@@ -235,7 +275,33 @@ static String tdmDashboardHtml()
            "set('ap_ssid',a.ssid);set('ap_ip',a.ip);set('ap_clients',a.clients);set('ap_channel',a.channel);"
            "set('sim',yn(t.simReady));set('lte_reg',yn(t.lteRegistered));set('pdp',yn(t.pdpActive));set('lte_ip',t.lteIp);set('rssi',t.rssiDbm? t.rssiDbm+' dBm':'-');set('gnss_engine',yn(t.gnssEngineRunning));set('gnss',yn(t.gnssValid));set('gnss_fix',t.gnssFixText);set('gnss_sat',t.gnssSatellites);set('gnss_used',t.gnssDopValid?t.gnssSatellitesUsed:'N/A');set('gnss_hdop',t.gnssHdop);set('gnss_vdop',t.gnssDopValid?t.gnssVdop:'N/A');set('gnss_pdop',t.gnssDopValid?t.gnssPdop:'N/A');set('gnss_utc',t.gnssUtc);set('gnss_date',t.gnssDate);set('gnss_age',t.gnssAgeMs+' ms');set('gnss_lat',t.gnssLat);set('gnss_lon',t.gnssLon);set('gnss_alt',t.gnssAlt+' m');set('gnss_speed',t.gnssSpeed+' m/s');set('gnss_course',t.gnssCourseValid?t.gnssCourse+' deg':'N/A');"
            "set('mqtt',yn(t.mqttConnected));set('broker',t.broker);set('topic',t.topic);set('msgcnt',t.msgCnt);set('pubage',t.lastPublishAgeMs? t.lastPublishAgeMs+' ms':'-');set('err',t.lastError);"
-           "set('source',q['STATUS:DATA_SOURCE']);set('mav',q['MAVLINK:Connected']);let bid=q['BASICID:UASID']||'';set('basic_id',bid||'N/A');set('basic_type',q['BASICID:IDType']||'N/A');set('basic_source',bid?'OpenDroneID Basic ID':'Device ID fallback');set('device_id',t.deviceId);set('uav_serial',t.uavSerial||bid||t.deviceId);set('object_id',bid||t.deviceId);set('lat',q['LOCATION:Latitude']);set('lon',q['LOCATION:Longitude']);set('alt',q['LOCATION:AltitudeGeo']+' m');set('speed',q['LOCATION:SpeedHorizontal']+' m/s');set('hdg',q['LOCATION:Direction']+' deg');}catch(e){set('err','dashboard poll failed');}}"
+           "set('source',q['STATUS:DATA_SOURCE']);set('mav',q['MAVLINK:Connected']);let bid=q['BASICID:UASID']||'';set('basic_id',bid||'N/A');set('basic_type',q['BASICID:IDType']||'N/A');set('basic_source',bid?'OpenDroneID Basic ID':'Device ID fallback');set('device_id',t.deviceId);set('uav_serial',t.uavSerial||bid||t.deviceId);set('object_id',bid||t.deviceId);set('lat',q['LOCATION:Latitude']);set('lon',q['LOCATION:Longitude']);set('alt',q['LOCATION:AltitudeGeo']+' m');set('speed',q['LOCATION:SpeedHorizontal']+' m/s');set('hdg',q['LOCATION:Direction']+' deg');"
+#if TDM2421_USE_EXT_GPS
+           "let g=j.extgps||{};"
+           "set('extgps_conn',g.connected?'<span class=ok>ĐÃ CẮM</span>':'<span class=bad>CHƯA CẮM</span>');"
+           "set('extgps_cfg_hz',(g.configuredHz||'-')+' Hz');"
+           "set('extgps_meas_hz',g.connected?(g.measuredHz+' Hz'):'-');"
+           "set('extgps_age',g.nmeaAgeMs?g.nmeaAgeMs+' ms':'-');"
+           "set('extgps_fix',(g.fixValid?(g.fixType+'D FIX'):'NO FIX')+' / '+(g.sats||0)+' sats');"
+           "set('extgps_lat',g.fixValid?g.lat:'-');set('extgps_lon',g.fixValid?g.lon:'-');"
+           "set('extgps_alt',g.fixValid?(g.alt+' m'):'-');set('extgps_spd',g.fixValid?(g.speed+' m/s'):'-');"
+           "set('extgps_hdop',g.connected?g.hdop:'-');"
+#endif
+           "}catch(e){set('err','dashboard poll failed');}}"
+#if TDM2421_USE_EXT_GPS
+           "async function applyGpsRate(){let hz=document.getElementById('extgps_rate_sel').value;set('extgps_msg','Đang gửi lệnh đổi tần số '+hz+' Hz...');"
+           "try{let r=await fetch('/api/extgps/rate?hz='+encodeURIComponent(hz),{method:'POST'});let j=await r.json();"
+           "set('extgps_msg',j.ok?('Đã cấu hình GPS sang '+j.hz+' Hz và lưu NVS.'):'Lỗi cấu hình tần số GPS.');poll();}catch(e){set('extgps_msg','Không gửi được yêu cầu đổi tần số.');}}"
+           "async function runGpsTest(){let btn=document.getElementById('btn_gps_test');btn.disabled=true;btn.textContent='Đang thu 1s...';set('extgps_msg','Đang thu dữ liệu từ module GPS trong 1 giây...');"
+           "try{await fetch('/api/extgps/test',{method:'POST'});await new Promise(res=>setTimeout(res,1100));"
+           "let r=await fetch('/api/extgps/test',{cache:'no-store'});let d=await r.json();let tries=0;"
+           "while(d.active&&tries<10){await new Promise(res=>setTimeout(res,150));r=await fetch('/api/extgps/test',{cache:'no-store'});d=await r.json();tries++;}"
+           "document.getElementById('extgps_test_box').style.display='block';"
+           "set('test_summary',(d.connected?'ĐÃ CẮM':'CHƯA CẮM')+' | '+d.byteCount+' bytes | RMC='+d.rmcCount+' GGA='+d.ggaCount+' GSV='+d.gsvCount+' | Thấy '+(d.satsInView||0)+' vệ tinh, max SNR='+(d.maxSnr||0)+' dB-Hz (~'+d.measuredHz+' Hz)');"
+           "set('test_fix',d.fixValid?(d.fixType+'D FIX | sats='+d.sats+' | lat='+d.lat+' lon='+d.lon+' | alt='+d.alt+'m | spd='+d.speed+'m/s | hdop='+d.hdop):'Chưa có fix vệ tinh (NO FIX)');"
+           "document.getElementById('test_samples').textContent=d.samples||'(Không nhận được câu NMEA nào trong 1 giây — kiểm tra dây TX/RX GPIO 4/5 hoặc nguồn GPS)';"
+           "set('extgps_msg','Test hoàn tất.');}catch(e){set('extgps_msg','Lỗi khi test module GPS.');}finally{btn.disabled=false;btn.textContent='Test module (1s)';}}"
+#endif
            "poll();setInterval(poll,1000);</script></body></html>");
     return h;
 }
@@ -262,6 +328,9 @@ static void setupTDM2421Routes()
         s = "{";
         s += "\"tdm\":" + tdm2421_mqtt.statusJson() + ",";
         s += "\"rid\":" + status_json() + ",";
+#if TDM2421_USE_EXT_GPS
+        s += "\"extgps\":" + tdm2421_gps.statusJson() + ",";
+#endif
         s += "\"ap\":{";
         s += "\"ssid\":\"" + jsonEscape(g.wifi_ssid) + "\",";
         s += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
@@ -271,6 +340,30 @@ static void setupTDM2421Routes()
         server.sendHeader("Cache-Control", "no-store");
         server.send(200, "application/json", s);
     });
+#if TDM2421_USE_EXT_GPS
+    // API đổi tần số tính toán GPS ngoài (chỉ nhận 1, 5 hoặc 10 Hz) và lưu NVS.
+    server.on("/api/extgps/rate", HTTP_POST, []() {
+        const int hz = server.hasArg("hz") ? server.arg("hz").toInt() : 0;
+        const bool ok = (hz == 1 || hz == 5 || hz == 10) && tdm2421_gps.setRateHz((uint8_t)hz);
+        server.sendHeader("Cache-Control", "no-store");
+        if (!ok) {
+            server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid hz (use 1, 5, or 10)\"}");
+            return;
+        }
+        server.send(200, "application/json", String("{\"ok\":true,\"hz\":") + String(hz) + "}");
+    });
+    // API bắt đầu thu mẫu 1 giây từ module GPS ngoài (không chặn loop).
+    server.on("/api/extgps/test", HTTP_POST, []() {
+        tdm2421_gps.startTestCapture(1000);
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(200, "application/json", "{\"started\":true,\"durationMs\":1000}");
+    });
+    // API lấy kết quả sau khi thu mẫu 1 giây từ module GPS ngoài.
+    server.on("/api/extgps/test", HTTP_GET, []() {
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(200, "application/json", tdm2421_gps.testStatusJson());
+    });
+#endif
     server.on("/save", HTTP_POST, []() {
         TDM2421Config cfg {};
         tdm2421_mqtt.getConfig(cfg);

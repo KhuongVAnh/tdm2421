@@ -52,8 +52,11 @@ public:
     void getConfig(TDM2421Config &out);
     bool saveConfig(const TDM2421Config &cfg);
 
-    // GNSS fix read directly from the EG800K. Thread-safe.
+    // Đọc tọa độ GNSS mới nhất (từ EG800K hoặc do GPS ngoài cập nhật). An toàn đa luồng.
     bool getGNSSFix(TDM2421GNSSFix &out, uint32_t max_age_ms = 5000);
+    // Cập nhật bản ghi GNSS dùng chung từ driver GPS ngoài trên Serial1
+    // để Web Dashboard (/api/status) hiển thị đúng thông số GPS 10 Hz.
+    void updateExternalGNSS(const TDM2421GNSSFix &fix);
 
     // JSON helpers for the local Web dashboard. Passwords are never returned.
     String configJson();

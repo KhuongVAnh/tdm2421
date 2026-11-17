@@ -25,6 +25,7 @@
 #include "efuse.h"
 #include "led.h"
 #include "tdm2421_mqtt.h"
+#include "tdm2421_gps.h"
 
 
 #if AP_DRONECAN_ENABLED
@@ -189,8 +190,13 @@ void setup()
                   (unsigned)g.ua_type, (unsigned)g.id_type, g.uas_id);
 #endif
 
+#if defined(BOARD_TDM2421) && TDM2421_USE_EXT_GPS
+    // Tắt MAVLink trên Serial1: dùng Serial1 (GPIO 4/5) cho module GPS ngoài 10 Hz.
+    tdm2421_gps.begin();
+#else
     // Serial1 for MAVLink
     Serial1.begin(g.baudrate, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
+#endif
 
 #if defined(BOARD_TDM2421)
     // TDM2421 UART0 is physically wired to Quectel EG800K.
@@ -218,7 +224,9 @@ void setup()
     odid_initUasData(&UAS_data);
 
 #if AP_MAVLINK_ENABLED
+#if !(defined(BOARD_TDM2421) && TDM2421_USE_EXT_GPS)
     mavlink1.init();
+#endif
 #if !defined(BOARD_TDM2421)
     mavlink2.init();
 #endif
@@ -478,6 +486,25 @@ static void set_data(Transport &t)
     }
 }
 
+#if defined(BOARD_TDM2421)
+// Hàm dùng chung để nạp bản ghi GNSS (từ GPS ngoài hoặc EG800K) vào UAS_data.Location.
+static void apply_gnss_fix_to_location(const TDM2421GNSSFix &fix, float timestamp_s)
+{
+    UAS_data.Location.Status = ODID_STATUS_AIRBORNE;
+    UAS_data.Location.Direction = fix.course_deg;
+    UAS_data.Location.SpeedHorizontal = fix.speed_mps;
+    UAS_data.Location.SpeedVertical = 0.0f;
+    UAS_data.Location.Latitude = fix.latitude;
+    UAS_data.Location.Longitude = fix.longitude;
+    UAS_data.Location.AltitudeGeo = fix.altitude_m;
+    UAS_data.Location.AltitudeBaro = fix.altitude_m;
+    UAS_data.Location.HeightType = ODID_HEIGHT_REF_OVER_TAKEOFF;
+    UAS_data.Location.Height = fix.altitude_m;
+    UAS_data.Location.TimeStamp = timestamp_s;
+    UAS_data.LocationValid = 1;
+}
+#endif
+
 static uint8_t loop_counter = 0;
 
 void loop()
@@ -507,8 +534,11 @@ void loop()
 #endif
 
 #else
-    // Normal mode: receive OpenDroneID data from MAVLink / DroneCAN.
-#if AP_MAVLINK_ENABLED
+    // Chế độ chạy bình thường: nhận dữ liệu từ GPS ngoài (TDM2421_USE_EXT_GPS) hoặc MAVLink/DroneCAN.
+#if defined(BOARD_TDM2421) && TDM2421_USE_EXT_GPS
+    // Đọc liên tục bản tin NMEA 10 Hz từ module GPS ngoài trên Serial1.
+    tdm2421_gps.update();
+#elif AP_MAVLINK_ENABLED
     mavlink1.update();
 #if !defined(BOARD_TDM2421)
     mavlink2.update();
@@ -534,6 +564,13 @@ void loop()
     #error "Must enable DroneCAN or MAVLink"
 #endif
 
+#if defined(BOARD_TDM2421) && TDM2421_USE_EXT_GPS
+    // Đã tắt MAVLink để nhường Serial1 cho GPS ngoài.
+    const uint32_t last_system_ms = 0;
+    const bool mav_location_fresh = false;
+    status_mavlink_connected = false;
+    status_mavlink_age_ms = 0;
+#else
     const uint32_t transport_last_location_ms = transport.get_last_location_ms();
     const uint32_t last_system_ms = transport.get_last_system_ms();
     // Source hysteresis: keep MAVLink selected through short gaps between
@@ -548,6 +585,7 @@ void loop()
     status_mavlink_connected = mav_location_fresh;
     status_mavlink_age_ms = transport_last_location_ms == 0 ? 0 :
                             now_ms - transport_last_location_ms;
+#endif
 
     led.update();
     status_reason = "";
@@ -557,7 +595,28 @@ void loop()
     // location fields are overwritten below with a fresh EG800K GNSS fix.
     set_data(transport);
 
-#if defined(BOARD_TDM2421)
+#if defined(BOARD_TDM2421) && TDM2421_USE_EXT_GPS
+    // Chế độ chạy độc lập với GPS ngoài 10 Hz trên Serial1 (không MAVLink, không EG800K GNSS).
+    // BasicID[0] được nạp tự động từ tham số local/NVS thông qua set_data(transport) ở trên.
+    TDM2421GNSSFix ext_fix {};
+    float ext_ts_s = 0.0f;
+    // Ngưỡng hết hạn 2500 ms để hỗ trợ an toàn cả khi người dùng chọn cấu hình 1 Hz (1000 ms/lần).
+    const bool ext_gps_fresh = tdm2421_gps.getFix(ext_fix, ext_ts_s, 2500);
+    bool selected_location_valid = false;
+    uint32_t selected_location_age_ms = 0;
+
+    if (ext_gps_fresh) {
+        apply_gnss_fix_to_location(ext_fix, ext_ts_s);
+        selected_location_valid = true;
+        selected_location_age_ms = ext_fix.age_ms;
+        status_data_source = "EXT_GPS";
+    } else {
+        status_data_source = "NO_LOCATION";
+        UAS_data.Location.Status = ODID_STATUS_REMOTE_ID_SYSTEM_FAILURE;
+        UAS_data.LocationValid = 0;
+        status_reason = "No fresh external GPS fix";
+    }
+#elif defined(BOARD_TDM2421)
     // ------------------------------------------------------------------
     // v7: sticky MAVLink RID identity latch, independent of POSITION.
     //
@@ -644,6 +703,7 @@ void loop()
     TDM2421GNSSFix eg_fix {};
     const bool eg_gnss_fresh = tdm2421_mqtt.getGNSSFix(eg_fix, 5000);
     bool selected_location_valid = false;
+    uint32_t selected_location_age_ms = status_mavlink_age_ms;
 
     // Last-good MAVLink location latch.  set_data() clears UAS_data every
     // iteration, so retain a complete decoded ODID location independently.
@@ -669,19 +729,9 @@ void loop()
         selected_location_valid = true;
     } else if (eg_gnss_fresh) {
         // Priority 2: direct EG800K GNSS fallback.
-        UAS_data.Location.Status = ODID_STATUS_AIRBORNE;
-        UAS_data.Location.Direction = eg_fix.course_deg;
-        UAS_data.Location.SpeedHorizontal = eg_fix.speed_mps;
-        UAS_data.Location.SpeedVertical = 0.0f;
-        UAS_data.Location.Latitude = eg_fix.latitude;
-        UAS_data.Location.Longitude = eg_fix.longitude;
-        UAS_data.Location.AltitudeGeo = eg_fix.altitude_m;
-        UAS_data.Location.AltitudeBaro = eg_fix.altitude_m;
-        UAS_data.Location.HeightType = ODID_HEIGHT_REF_OVER_TAKEOFF;
-        UAS_data.Location.Height = eg_fix.altitude_m;
-        UAS_data.Location.TimeStamp = 0.0f;
-        UAS_data.LocationValid = 1;
+        apply_gnss_fix_to_location(eg_fix, 0.0f);
         selected_location_valid = true;
+        selected_location_age_ms = eg_fix.age_ms;
         status_data_source = "EG800K_GNSS";
         status_reason = "MAVLink location unavailable; using EG800K GNSS";
     } else {
@@ -708,9 +758,19 @@ void loop()
     // selected/restored. This prevents transient LOC/SYS errors caused by
     // odid_initUasData() inside set_data().
     const char *reason = check_parse();
+#if defined(BOARD_TDM2421) && TDM2421_USE_EXT_GPS
+    // Chế độ chạy độc lập không có MAVLink: chỉ cần dữ liệu encode OpenDroneID hợp lệ,
+    // có BasicID và GPS ngoài đang có fix mới thì bật đèn trạng thái ARM_OK.
+    arm_check_ok = (reason == nullptr) && selected_location_valid && g.have_basic_id_info();
+    if (reason == nullptr && !selected_location_valid) {
+        reason = status_reason.c_str();
+    }
+    transport.set_parse_fail(reason);
+#else
     transport.arm_status_check(reason);
     transport.set_parse_fail(reason);
     arm_check_ok = (reason == nullptr);
+#endif
     if (g.options & OPTIONS_FORCE_ARM_OK) {
         arm_check_ok = true;
     }
@@ -741,7 +801,7 @@ void loop()
         last_rid_source_reported = rid_source_detail;
         Serial.printf("[RID SOURCE] %s age=%lu ms valid=%u lat=%.7f lon=%.7f alt=%.1f height=%.1f speed=%.2f\r\n",
                       rid_source_detail.c_str(),
-                      mav_location_fresh ? (unsigned long)status_mavlink_age_ms : 0UL,
+                      selected_location_valid ? (unsigned long)selected_location_age_ms : 0UL,
                       (unsigned)UAS_data.LocationValid,
                       UAS_data.Location.Latitude,
                       UAS_data.Location.Longitude,
@@ -780,7 +840,8 @@ void loop()
     } else {
         // Broadcast only when at least one real location source is fresh.
 #if defined(BOARD_TDM2421)
-        if (!mav_location_fresh && !eg_gnss_fresh) {
+        // Chỉ phát sóng Wi-Fi/BLE khi đã có nguồn tọa độ hợp lệ (GPS ngoài hoặc EG800K/MAVLink).
+        if (!selected_location_valid) {
             delay(1);
             return;
         }

@@ -1,3 +1,8 @@
+#pragma once
+
+// Tự include các header chuẩn để file .h độc lập, tránh lỗi IntelliSense khi mở riêng.
+#include <stdint.h>
+#include <string.h>
 
 struct CANFrame;
 

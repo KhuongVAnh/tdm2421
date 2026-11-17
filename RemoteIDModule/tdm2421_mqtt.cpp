@@ -352,6 +352,20 @@ bool TDM2421MQTT::getGNSSFix(TDM2421GNSSFix &out, uint32_t max_age_ms)
     return true;
 }
 
+void TDM2421MQTT::updateExternalGNSS(const TDM2421GNSSFix &fix)
+{
+    // Cập nhật bản ghi GNSS dùng chung từ GPS ngoài (Serial1) để trang Web /api/status
+    // hiển thị đúng tọa độ, độ cao, số vệ tinh và HDOP theo thời gian thực.
+    gnss_started = true;
+    if (gnss_mutex == nullptr ||
+        xSemaphoreTake(gnss_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return;
+    }
+    gnss_fix = fix;
+    gnss_last_fix_ms = millis();
+    xSemaphoreGive(gnss_mutex);
+}
+
 bool TDM2421MQTT::ensureGNSS()
 {
     // First verify whether GNSS is already running.
@@ -1242,15 +1256,21 @@ void TDM2421MQTT::task()
         if (!modem_seen && now - last_modem_probe >= 5000UL) {
             last_modem_probe = now;
             modem_seen = modemReady();
+#if !TDM2421_USE_EXT_GPS
             if (modem_seen) ensureGNSS();
+#endif
         }
 
         if (!network_ok || !mqtt_ok) {
+#if !TDM2421_USE_EXT_GPS
             // No active MQTT stream: GNSS may continue at 1 Hz while reconnecting.
             if (modem_seen && now - last_gnss >= 1000UL) {
                 last_gnss = now;
                 refreshGNSS();
             }
+#else
+            (void)last_gnss; // Đã tắt hỏi GNSS trên EG800K khi dùng GPS ngoài qua Serial1.
+#endif
             if (now - last_reconnect >= cfg.reconnect_interval_ms) {
                 last_reconnect = now;
                 if (!modem_seen) {
@@ -1259,7 +1279,9 @@ void TDM2421MQTT::task()
                         delay(1000);
                         continue;
                     }
+#if !TDM2421_USE_EXT_GPS
                     ensureGNSS();
+#endif
                 }
                 if (!ensureNetwork()) {
                     // GNSS is independent; do not invalidate an existing GNSS fix.
@@ -1308,10 +1330,12 @@ void TDM2421MQTT::task()
 
         // Low-rate housekeeping only runs between MQTT deadlines. Both commands
         // use the same UART as MQTT, so they must never be checked before publish.
+#if !TDM2421_USE_EXT_GPS
         if (modem_seen && now - last_gnss >= GNSS_REFRESH_INTERVAL_MS) {
             last_gnss = now;
             refreshGNSS();
         }
+#endif
 
         if (now - last_signal >= SIGNAL_REFRESH_INTERVAL_MS) {
             last_signal = now;
