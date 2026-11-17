@@ -26,6 +26,7 @@
 #include "led.h"
 #include "tdm2421_mqtt.h"
 #include "tdm2421_gps.h"
+#include "tdm2421_debug.h"
 
 
 #if AP_DRONECAN_ENABLED
@@ -184,8 +185,12 @@ void setup()
     // Serial for debug printf
     Serial.begin(g.baudrate);
 #if defined(BOARD_TDM2421)
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+    // Đặt timeout TX USB CDC về 0 để không bao giờ bị treo 200 ms khi rút cáp USB.
+    Serial.setTxTimeoutMs(0);
+#endif
     delay(50);
-    Serial.printf("[RID] BasicID config: valid=%s UAType=%u IDType=%u UASID='%s'\r\n",
+    tdmDebugPrintf(1, "[RID] BasicID config: valid=%s UAType=%u IDType=%u UASID='%s'\r\n",
                   g.have_basic_id_info() ? "YES" : "NO",
                   (unsigned)g.ua_type, (unsigned)g.id_type, g.uas_id);
 #endif
@@ -202,16 +207,16 @@ void setup()
     // TDM2421 UART0 is physically wired to Quectel EG800K.
     // Serial remains native USB CDC and is used for debug.
     // SIM_PWR_EN (GPIO2) was already asserted at the very start of setup().
-    Serial.printf("[TDM2421] SIM power: GPIO%d = HIGH (enabled early)\r\n",
+    tdmDebugPrintf(1, "[TDM2421] SIM power: GPIO%d = HIGH (enabled early)\r\n",
                   (int)PIN_SIM_PWR_EN);
 
     pinMode(PIN_SIM_DTR, OUTPUT);
     digitalWrite(PIN_SIM_DTR, HIGH);
-    Serial.printf("[TDM2421] SIM DTR: GPIO%d = HIGH\r\n", (int)PIN_SIM_DTR);
+    tdmDebugPrintf(1, "[TDM2421] SIM DTR: GPIO%d = HIGH\r\n", (int)PIN_SIM_DTR);
 
     Serial0.begin(SIM_UART_BAUD, SERIAL_8N1,
                   PIN_SIM_UART_RX, PIN_SIM_UART_TX);
-    Serial.printf("[TDM2421] EG800K UART started: baud=%u RX=GPIO%d TX=GPIO%d\r\n",
+    tdmDebugPrintf(1, "[TDM2421] EG800K UART started: baud=%u RX=GPIO%d TX=GPIO%d\r\n",
                   (unsigned)SIM_UART_BAUD,
                   (int)PIN_SIM_UART_RX, (int)PIN_SIM_UART_TX);
 
@@ -653,7 +658,7 @@ void loop()
             last_good_mav_basic_id.IDType = (ODID_idtype_t)rx_basic_id.id_type;
             ODID_COPY_STR(last_good_mav_basic_id.UASID, rx_basic_id.uas_id);
             have_last_good_mav_basic_id = true;
-            Serial.printf("[RID ID LATCH] BASIC_ID='%s'\r\n",
+            tdmDebugPrintf(2, "[RID ID LATCH] BASIC_ID='%s'\r\n",
                           last_good_mav_basic_id.UASID);
         }
     }
@@ -667,7 +672,7 @@ void loop()
             ODID_COPY_STR(last_good_mav_operator_id.OperatorId,
                           rx_operator_id.operator_id);
             have_last_good_mav_operator_id = true;
-            Serial.printf("[RID ID LATCH] OPERATOR_ID='%s'\r\n",
+            tdmDebugPrintf(2, "[RID ID LATCH] OPERATOR_ID='%s'\r\n",
                           last_good_mav_operator_id.OperatorId);
         }
     }
@@ -679,7 +684,7 @@ void loop()
         if (UAS_data.SystemValid) {
             last_good_mav_system = UAS_data.System;
             have_last_good_mav_system = true;
-            Serial.printf("[RID ID LATCH] SYSTEM pilotLat=%.7f pilotLon=%.7f\r\n",
+            tdmDebugPrintf(2, "[RID ID LATCH] SYSTEM pilotLat=%.7f pilotLon=%.7f\r\n",
                           last_good_mav_system.OperatorLatitude,
                           last_good_mav_system.OperatorLongitude);
         }
@@ -799,7 +804,7 @@ void loop()
         now_ms - last_rid_source_report_ms >= 1000) {
         last_rid_source_report_ms = now_ms;
         last_rid_source_reported = rid_source_detail;
-        Serial.printf("[RID SOURCE] %s age=%lu ms valid=%u lat=%.7f lon=%.7f alt=%.1f height=%.1f speed=%.2f\r\n",
+        tdmDebugPrintf(2, "[RID SOURCE] %s age=%lu ms valid=%u lat=%.7f lon=%.7f alt=%.1f height=%.1f speed=%.2f\r\n",
                       rid_source_detail.c_str(),
                       selected_location_valid ? (unsigned long)selected_location_age_ms : 0UL,
                       (unsigned)UAS_data.LocationValid,
@@ -822,7 +827,7 @@ void loop()
             now_ms - last_mqtt_source_report_ms >= 1000) {
             last_mqtt_source_report_ms = now_ms;
             last_mqtt_source_reported = rid_source_detail;
-            Serial.printf("[MQTT SOURCE] %s\r\n", rid_source_detail.c_str());
+            tdmDebugPrintf(2, "[MQTT SOURCE] %s\r\n", rid_source_detail.c_str());
         }
         // Single source of truth for RID identity: UAS_data.
         // The sticky MAVLink identity latch above is applied to UAS_data BEFORE

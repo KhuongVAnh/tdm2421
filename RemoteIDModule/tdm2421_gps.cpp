@@ -1,4 +1,5 @@
 #include "tdm2421_gps.h"
+#include "tdm2421_debug.h"
 
 #if defined(BOARD_TDM2421) && TDM2421_USE_EXT_GPS
 
@@ -136,7 +137,7 @@ void TDM2421ExtGPS::begin()
     }
 
     rate_win_start_ms_ = millis();
-    Serial.printf("[EXT GPS] Serial1 started at %u bps (RX=GPIO%d TX=GPIO%d, %u Hz)\r\n",
+    tdmDebugPrintf(1, "[EXT GPS] Serial1 started at %u bps (RX=GPIO%d TX=GPIO%d, %u Hz)\r\n",
                   (unsigned)GPS_UART_BAUD, (int)PIN_GPS_UART_RX,
                   (int)PIN_GPS_UART_TX, (unsigned)configured_hz_);
 }
@@ -166,7 +167,7 @@ bool TDM2421ExtGPS::setRateHz(uint8_t hz)
     rate_win_count_ = 0;
     measured_hz_ = 0;
 
-    Serial.printf("[EXT GPS] Updated GPS rate to %u Hz\r\n", (unsigned)configured_hz_);
+    tdmDebugPrintf(1, "[EXT GPS] Updated GPS rate to %u Hz\r\n", (unsigned)configured_hz_);
     return true;
 }
 
@@ -406,11 +407,11 @@ void TDM2421ExtGPS::handleRMC(char *fields[], size_t nfields)
     // Đẩy dữ liệu sang TDM2421MQTT để Web Dashboard (/api/status) hiển thị thông số GNSS.
     tdm2421_mqtt.updateExternalGNSS(current_fix_);
 
-    // Chỉ in log debug ra USB mỗi 1 giây/lần để tránh làm nghẽn Serial khi GPS chạy 10 Hz.
+    // Chỉ in log debug không chặn ra USB mỗi 1 giây/lần để tránh làm nghẽn lúc không mở Serial Monitor.
     static uint32_t last_log_ms = 0;
     if (now_ms - last_log_ms >= 1000U) {
         last_log_ms = now_ms;
-        Serial.printf("[EXT GPS] fix=%uD sats=%u lat=%.7f lon=%.7f alt=%.1fm spd=%.2fm/s hdg=%.1f hdop=%.2f\r\n",
+        tdmDebugPrintf(2, "[EXT GPS] fix=%uD sats=%u lat=%.7f lon=%.7f alt=%.1fm spd=%.2fm/s hdg=%.1f hdop=%.2f\r\n",
                       (unsigned)fix.fix_type, (unsigned)fix.satellites,
                       fix.latitude, fix.longitude, fix.altitude_m,
                       fix.speed_mps, fix.course_deg, fix.hdop);

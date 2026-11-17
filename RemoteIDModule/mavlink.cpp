@@ -18,6 +18,7 @@
 // main loop and is used only when no MAVLink location has been received for 5 s.
 static uint32_t last_native_odid_location_ms;
 static uint32_t last_global_position_ms;
+#include "tdm2421_debug.h"
 static uint32_t last_gps_raw_ms;
 static uint32_t last_mav_rx_report_ms;
 static uint32_t mav_rx_frames;
@@ -191,7 +192,7 @@ void MAVLinkSerial::update_receive(void)
     if ((mav_rx_bytes > 0 || mav_rx_frames > 0) &&
         now_ms - last_mav_rx_report_ms >= 2000) {
         last_mav_rx_report_ms = now_ms;
-        Serial.printf("[MAV RX] bytes=%lu frames=%lu sysid=%u age_location=%lu ms\r\n",
+        tdmDebugPrintf(2, "[MAV RX] bytes=%lu frames=%lu sysid=%u age_location=%lu ms\r\n",
                       (unsigned long)mav_rx_bytes,
                       (unsigned long)mav_rx_frames,
                       (unsigned)mavlink_system.sysid,
@@ -241,7 +242,7 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
         last_native_odid_location_ms = now_ms;
         mav_rid_location_source = MAVRIDLocationSource::OPEN_DRONE_ID_LOCATION;
 #if defined(BOARD_TDM2421)
-        Serial.printf("[MAV RX] OPEN_DRONE_ID_LOCATION lat=%.7f lon=%.7f alt=%.1f h=%.1f speed=%.2f\r\n",
+        tdmDebugPrintf(2, "[MAV RX] OPEN_DRONE_ID_LOCATION lat=%.7f lon=%.7f alt=%.1f h=%.1f speed=%.2f\r\n",
                       location.latitude * 1.0e-7,
                       location.longitude * 1.0e-7,
                       location.altitude_geodetic,
@@ -249,7 +250,7 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
                       location.speed_horizontal * 0.01f);
 #else
         if (g.options & OPTIONS_PRINT_RID_MAVLINK) {
-            Serial.printf("MAVLink: got Location\r\n");
+            tdmDebugPrintf(2, "MAVLink: got Location\r\n");
         }
 #endif
         if (last_location_timestamp != location.timestamp) {
@@ -301,7 +302,7 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
         last_location_timestamp = location.timestamp;
 
 #if defined(BOARD_TDM2421)
-        Serial.printf("[MAV RX] GLOBAL_POSITION_INT lat=%.7f lon=%.7f alt=%.1f rel=%.1f speed=%.2f hdg=%.1f\r\n",
+        tdmDebugPrintf(2, "[MAV RX] GLOBAL_POSITION_INT lat=%.7f lon=%.7f alt=%.1f rel=%.1f speed=%.2f hdg=%.1f\r\n",
                       location.latitude * 1.0e-7,
                       location.longitude * 1.0e-7,
                       location.altitude_geodetic, location.height,
@@ -353,7 +354,7 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
         last_location_timestamp = location.timestamp;
 
 #if defined(BOARD_TDM2421)
-        Serial.printf("[MAV RX] GPS_RAW_INT fix=%u sats=%u lat=%.7f lon=%.7f alt=%.1f speed=%.2f\r\n",
+        tdmDebugPrintf(2, "[MAV RX] GPS_RAW_INT fix=%u sats=%u lat=%.7f lon=%.7f alt=%.1f speed=%.2f\r\n",
                       (unsigned)p.fix_type, (unsigned)p.satellites_visible,
                       location.latitude * 1.0e-7,
                       location.longitude * 1.0e-7,
@@ -366,13 +367,13 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
     case MAVLINK_MSG_ID_OPEN_DRONE_ID_BASIC_ID: {
         mavlink_open_drone_id_basic_id_t basic_id_tmp;
         if (g.options & OPTIONS_PRINT_RID_MAVLINK) {
-            Serial.printf("MAVLink: got BasicID\r\n");
+            tdmDebugPrintf(2, "MAVLink: got BasicID\r\n");
         }
         mavlink_msg_open_drone_id_basic_id_decode(&msg, &basic_id_tmp);
 #if defined(BOARD_TDM2421)
         char dbg_uas_id[21] = {};
         memcpy(dbg_uas_id, basic_id_tmp.uas_id, 20);
-        Serial.printf("[MAV RID RX] BASIC_ID sys=%u comp=%u id_type=%u ua_type=%u uas_id='%s'\r\n",
+        tdmDebugPrintf(2, "[MAV RID RX] BASIC_ID sys=%u comp=%u id_type=%u ua_type=%u uas_id='%s'\r\n",
                       (unsigned)msg.sysid, (unsigned)msg.compid,
                       (unsigned)basic_id_tmp.id_type, (unsigned)basic_id_tmp.ua_type, dbg_uas_id);
 #endif
@@ -386,7 +387,7 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
     case MAVLINK_MSG_ID_OPEN_DRONE_ID_AUTHENTICATION: {
         mavlink_msg_open_drone_id_authentication_decode(&msg, &authentication);
         if (g.options & OPTIONS_PRINT_RID_MAVLINK) {
-            Serial.printf("MAVLink: got Auth\r\n");
+            tdmDebugPrintf(2, "MAVLink: got Auth\r\n");
         }
         break;
     }
@@ -395,12 +396,12 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
 #if defined(BOARD_TDM2421)
         char dbg_self_desc[24] = {};
         memcpy(dbg_self_desc, self_id.description, 23);
-        Serial.printf("[MAV RID RX] SELF_ID sys=%u comp=%u type=%u description='%s'\r\n",
+        tdmDebugPrintf(2, "[MAV RID RX] SELF_ID sys=%u comp=%u type=%u description='%s'\r\n",
                       (unsigned)msg.sysid, (unsigned)msg.compid,
                       (unsigned)self_id.description_type, dbg_self_desc);
 #endif
         if (g.options & OPTIONS_PRINT_RID_MAVLINK) {
-            Serial.printf("MAVLink: got SelfID\r\n");
+            tdmDebugPrintf(2, "MAVLink: got SelfID\r\n");
         }
         last_self_id_ms = now_ms;
         break;
@@ -412,7 +413,7 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
                                                           system_tmp.operator_longitude,
                                                           system_tmp.operator_altitude_geo);
 #if defined(BOARD_TDM2421)
-        Serial.printf("[MAV RID RX] SYSTEM sys=%u comp=%u op_loc_type=%u op_lat=%.7f op_lon=%.7f op_alt=%.1f area_count=%u radius=%u ts=%lu %s\r\n",
+        tdmDebugPrintf(2, "[MAV RID RX] SYSTEM sys=%u comp=%u op_loc_type=%u op_lat=%.7f op_lon=%.7f op_alt=%.1f area_count=%u radius=%u ts=%lu %s\r\n",
                       (unsigned)msg.sysid, (unsigned)msg.compid,
                       (unsigned)system_tmp.operator_location_type,
                       system_tmp.operator_latitude * 1.0e-7, system_tmp.operator_longitude * 1.0e-7,
@@ -427,7 +428,7 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
         }
         system = system_tmp;
         if (g.options & OPTIONS_PRINT_RID_MAVLINK) {
-            Serial.printf("MAVLink: got System\r\n");
+            tdmDebugPrintf(2, "MAVLink: got System\r\n");
         }
         if ((last_system_timestamp != system.timestamp) || (system.timestamp == 0)) {
             //only update the timestamp if we receive information with a different timestamp
@@ -438,12 +439,12 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
     }
     case MAVLINK_MSG_ID_OPEN_DRONE_ID_SYSTEM_UPDATE: {
         if (g.options & OPTIONS_PRINT_RID_MAVLINK) {
-            Serial.printf("MAVLink: got System update\r\n");
+            tdmDebugPrintf(2, "MAVLink: got System update\r\n");
         }
         mavlink_open_drone_id_system_update_t pkt_system_update;
         mavlink_msg_open_drone_id_system_update_decode(&msg, &pkt_system_update);
 #if defined(BOARD_TDM2421)
-        Serial.printf("[MAV RID RX] SYSTEM_UPDATE sys=%u comp=%u op_lat=%.7f op_lon=%.7f op_alt=%.1f ts=%lu\r\n",
+        tdmDebugPrintf(2, "[MAV RID RX] SYSTEM_UPDATE sys=%u comp=%u op_lat=%.7f op_lon=%.7f op_alt=%.1f ts=%lu\r\n",
                       (unsigned)msg.sysid, (unsigned)msg.compid,
                       pkt_system_update.operator_latitude * 1.0e-7,
                       pkt_system_update.operator_longitude * 1.0e-7,
@@ -455,7 +456,7 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
                                                           pkt_system_update.operator_altitude_geo);
         if (!op_loc_valid) {
 #if defined(BOARD_TDM2421)
-            Serial.printf("[MAV RID RX] SYSTEM_UPDATE REJECT_INVALID_OP_LOC sys=%u comp=%u\r\n",
+            tdmDebugPrintf(2, "[MAV RID RX] SYSTEM_UPDATE REJECT_INVALID_OP_LOC sys=%u comp=%u\r\n",
                           (unsigned)msg.sysid, (unsigned)msg.compid);
 #endif
             break;
@@ -481,12 +482,12 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
 #if defined(BOARD_TDM2421)
         char dbg_operator_id[21] = {};
         memcpy(dbg_operator_id, operator_id.operator_id, 20);
-        Serial.printf("[MAV RID RX] OPERATOR_ID sys=%u comp=%u type=%u id='%s'\r\n",
+        tdmDebugPrintf(2, "[MAV RID RX] OPERATOR_ID sys=%u comp=%u type=%u id='%s'\r\n",
                       (unsigned)msg.sysid, (unsigned)msg.compid,
                       (unsigned)operator_id.operator_id_type, dbg_operator_id);
 #endif
         if (g.options & OPTIONS_PRINT_RID_MAVLINK) {
-            Serial.printf("MAVLink: got OperatorID\r\n");
+            tdmDebugPrintf(2, "MAVLink: got OperatorID\r\n");
         }
         last_operator_id_ms = now_ms;
         break;
@@ -567,7 +568,7 @@ void MAVLinkSerial::arm_status_send(void)
     const uint32_t now_ms = millis();
     if (now_ms - last_arm_debug_ms >= 1000) {
         last_arm_debug_ms = now_ms;
-        Serial.printf("[MAV RID TX] ARM_STATUS status=%u reason='%s'\r\n",
+        tdmDebugPrintf(2, "[MAV RID TX] ARM_STATUS status=%u reason='%s'\r\n",
                       (unsigned)status, reason);
     }
 #endif

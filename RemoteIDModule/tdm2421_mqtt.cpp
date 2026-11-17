@@ -3,6 +3,7 @@
 #if defined(BOARD_TDM2421)
 
 #include "board_config.h"
+#include "tdm2421_debug.h"
 #include <Preferences.h>
 #include <inttypes.h>
 
@@ -137,11 +138,11 @@ void TDM2421MQTT::loadConfig()
     if (cfg.reconnect_interval_ms < 1000) cfg.reconnect_interval_ms = DEFAULT_RECONNECT_INTERVAL_MS;
 
 #if TDM2421_MQTT_HZ > 0
-    Serial.printf("[MQTT CONFIG] build rate=%u Hz interval=%lu ms (overrides NVS/Web)\r\n",
+    tdmDebugPrintf(1, "[MQTT CONFIG] build rate=%u Hz interval=%lu ms (overrides NVS/Web)\r\n",
                   (unsigned)TDM2421_MQTT_HZ,
                   (unsigned long)cfg.publish_interval_ms);
 #else
-    Serial.printf("[MQTT CONFIG] NVS/Web rate control interval=%lu ms\r\n",
+    tdmDebugPrintf(1, "[MQTT CONFIG] NVS/Web rate control interval=%lu ms\r\n",
                   (unsigned long)cfg.publish_interval_ms);
 #endif
 
@@ -244,7 +245,7 @@ String TDM2421MQTT::sendAT(const String &cmd, uint32_t timeout_ms)
     // QGPSLOC waited 900 ms even when the reply arrived in a few ms), which
     // made a 100 ms MQTT scheduler impossible.
     clearRX();
-    Serial.printf("[EG800K] >> %s\r\n", cmd.c_str());
+    tdmDebugPrintf(2, "[EG800K] >> %s\r\n", cmd.c_str());
     Serial0.println(cmd);
 
     String out;
@@ -272,7 +273,7 @@ String TDM2421MQTT::sendAT(const String &cmd, uint32_t timeout_ms)
         if (!received) delay(1);
     }
     if (out.length()) {
-        Serial.printf("[EG800K] << %s\r\n", out.c_str());
+        tdmDebugPrintf(2, "[EG800K] << %s\r\n", out.c_str());
     }
     return out;
 }
@@ -287,12 +288,12 @@ bool TDM2421MQTT::waitFor(const String &needle, uint32_t timeout_ms, String *cap
             buf += c;
             if (buf.indexOf(needle) >= 0) {
                 if (capture) *capture = buf;
-                Serial.printf("[EG800K] << %s\r\n", buf.c_str());
+                tdmDebugPrintf(2, "[EG800K] << %s\r\n", buf.c_str());
                 return true;
             }
             if (buf.indexOf("ERROR") >= 0) {
                 if (capture) *capture = buf;
-                Serial.printf("[EG800K] << %s\r\n", buf.c_str());
+                tdmDebugPrintf(2, "[EG800K] << %s\r\n", buf.c_str());
                 return false;
             }
             if (buf.length() > 4096) {
@@ -302,7 +303,7 @@ bool TDM2421MQTT::waitFor(const String &needle, uint32_t timeout_ms, String *cap
         delay(1);
     }
     if (capture) *capture = buf;
-    if (buf.length()) Serial.printf("[EG800K] << %s\r\n", buf.c_str());
+    if (buf.length()) tdmDebugPrintf(2, "[EG800K] << %s\r\n", buf.c_str());
     return false;
 }
 
@@ -374,19 +375,19 @@ bool TDM2421MQTT::ensureGNSS()
         gnss_started = true;
         // Best effort: enable NMEA acquisition so QGPSGNMEA="GSA" can provide PDOP/HDOP/VDOP.
         (void)sendAT("AT+QGPSCFG=\"nmeasrc\",1", 1000);
-        Serial.println("[GNSS] EG800K GNSS already running");
+        tdmDebugPrintln(1, "[GNSS] EG800K GNSS already running");
         return true;
     }
 
     // Put the modem GNSS engine into a known state. QGPSEND may legitimately
     // return ERROR if no GNSS session exists, so that response is not fatal.
-    Serial.println("[GNSS] resetting EG800K GNSS engine");
+    tdmDebugPrintln(1, "[GNSS] resetting EG800K GNSS engine");
     (void)sendAT("AT+QGPSEND", 1200);
     delay(250);
 
     r = sendAT("AT+QGPS=1", 2000);
     if (r.indexOf("OK") < 0) {
-        Serial.println("[GNSS] AT+QGPS=1 did not return OK; verifying state");
+        tdmDebugPrintln(1, "[GNSS] AT+QGPS=1 did not return OK; verifying state");
     }
 
     // Never trust only the start command response: verify the actual state.
@@ -395,9 +396,9 @@ bool TDM2421MQTT::ensureGNSS()
     gnss_started = (r.indexOf("+QGPS: 1") >= 0);
     if (gnss_started) {
         (void)sendAT("AT+QGPSCFG=\"nmeasrc\",1", 1000);
-        Serial.println("[GNSS] EG800K GNSS started and verified (+QGPS: 1)");
+        tdmDebugPrintln(1, "[GNSS] EG800K GNSS started and verified (+QGPS: 1)");
     } else {
-        Serial.println("[GNSS] EG800K GNSS unavailable/not started (+QGPS: 1 not seen)");
+        tdmDebugPrintln(1, "[GNSS] EG800K GNSS unavailable/not started (+QGPS: 1 not seen)");
     }
     return gnss_started;
 }
@@ -533,13 +534,13 @@ void TDM2421MQTT::refreshGNSS()
             static uint32_t last_no_fix_print = 0;
             if (millis() - last_no_fix_print >= 5000) {
                 last_no_fix_print = millis();
-                Serial.println("[GNSS] NO FIX (CME 516) - waiting for satellites");
+                tdmDebugPrintln(1, "[GNSS] NO FIX (CME 516) - waiting for satellites");
             }
         } else {
             static uint32_t last_parse_print = 0;
             if (millis() - last_parse_print >= 5000) {
                 last_parse_print = millis();
-                Serial.println("[GNSS] QGPSLOC response has no valid fix");
+                tdmDebugPrintln(1, "[GNSS] QGPSLOC response has no valid fix");
             }
         }
         // Keep the previous fix only until getGNSSFix() ages it out.
@@ -561,7 +562,7 @@ void TDM2421MQTT::refreshGNSS()
     static uint32_t last_print = 0;
     if (millis() - last_print >= 5000) {
         last_print = millis();
-        Serial.printf("[GNSS] fix=%u sats=%u lat=%.7f lon=%.7f alt=%.1f speed=%.2f course=%.1f hdop=%.1f\r\n",
+        tdmDebugPrintf(2, "[GNSS] fix=%u sats=%u lat=%.7f lon=%.7f alt=%.1f speed=%.2f course=%.1f hdop=%.1f\r\n",
                       fix.fix_type, fix.satellites, fix.latitude, fix.longitude,
                       fix.altitude_m, fix.speed_mps, fix.course_deg, fix.hdop);
     }
@@ -641,7 +642,7 @@ bool TDM2421MQTT::ensureNetwork()
 
     setNetworkState(true);
     setError("");
-    Serial.println("[MQTT] LTE/PDP ready");
+    tdmDebugPrintln(1, "[MQTT] LTE/PDP ready");
     return true;
 }
 
@@ -657,7 +658,7 @@ bool TDM2421MQTT::rawTcpOpen()
 
     String cmd = "AT+QIOPEN=1,0,\"TCP\",\"" + String(cfg.mqtt_host) +
                  "\"," + String(cfg.mqtt_port) + ",0,1";
-    Serial.printf("[RAW MQTT] >> %s\r\n", cmd.c_str());
+    tdmDebugPrintf(2, "[RAW MQTT] >> %s\r\n", cmd.c_str());
     Serial0.println(cmd);
 
     if (!waitFor("+QIOPEN: 0,0", 30000)) {
@@ -667,7 +668,7 @@ bool TDM2421MQTT::rawTcpOpen()
     }
 
     raw_socket_ok = true;
-    Serial.println("[RAW MQTT] TCP connected");
+    tdmDebugPrintln(1, "[RAW MQTT] TCP connected");
     return true;
 }
 
@@ -787,7 +788,7 @@ bool TDM2421MQTT::rawMqttConnect()
             }
             if (win_count == 4 && win[0] == 0x20 && win[1] == 0x02 &&
                 win[2] == 0x00 && win[3] == 0x00) {
-                Serial.println("[RAW MQTT] CONNACK accepted");
+                tdmDebugPrintln(1, "[RAW MQTT] CONNACK accepted");
                 return true;
             }
             if (c >= 0x20 && c <= 0x7E) {
@@ -799,7 +800,7 @@ bool TDM2421MQTT::rawMqttConnect()
         delay(1);
     }
 
-    Serial.println("[RAW MQTT] CONNACK timeout/rejected");
+    tdmDebugPrintln(1, "[RAW MQTT] CONNACK timeout/rejected");
     return false;
 }
 
@@ -846,7 +847,7 @@ void TDM2421MQTT::serviceRawSocket(uint32_t budget_ms)
         raw_socket_ok = false;
         setMQTTState(false);
         setError("Raw MQTT TCP socket closed");
-        Serial.println("[RAW MQTT] socket closed");
+        tdmDebugPrintln(1, "[RAW MQTT] socket closed");
     }
 }
 
@@ -870,7 +871,7 @@ bool TDM2421MQTT::ensureMQTT()
     setMQTTState(true);
     mqtt_last_ping_ms = millis();
     setError("");
-    Serial.println("[RAW MQTT] connected");
+    tdmDebugPrintln(1, "[RAW MQTT] connected");
     return true;
 }
 
@@ -920,7 +921,7 @@ bool TDM2421MQTT::syncTime()
     unix_base_ms = t;
     millis_base = millis();
     time_ok = true;
-    Serial.printf("[MQTT] network time synced: %llu ms\r\n", (unsigned long long)unix_base_ms);
+    tdmDebugPrintf(1, "[MQTT] network time synced: %llu ms\r\n", (unsigned long long)unix_base_ms);
     return true;
 }
 
@@ -1004,19 +1005,6 @@ bool TDM2421MQTT::publishSnapshot()
     const uint64_t ts = time_ok ? (unix_base_ms + time_delta_ms) : 0;
     msg_count++;
 
-    // Timestamp diagnostic at 1 Hz while MQTT publishes at 10 Hz.
-    // This makes it possible to determine whether an abnormal JSON timestamp
-    // originates on the ESP32 or is changed downstream, without flooding USB.
-    if ((msg_count % 10U) == 0U) {
-        Serial.printf(
-            "[TIME DEBUG] unix_base=%llu millis_base=%lu millis_now=%lu delta=%lu ts=%llu\r\n",
-            (unsigned long long)unix_base_ms,
-            (unsigned long)millis_base,
-            (unsigned long)millis_now,
-            (unsigned long)time_delta_ms,
-            (unsigned long long)ts);
-    }
-
     char payload[1024];
     const int n = snprintf(
         payload, sizeof(payload),
@@ -1050,11 +1038,11 @@ bool TDM2421MQTT::publishSnapshot()
 
     if (n <= 0 || n >= (int)sizeof(payload)) {
         setError("JSON buffer overflow");
-        Serial.println("[MQTT] JSON buffer overflow");
+        tdmDebugPrintln(1, "[MQTT] JSON buffer overflow");
         return false;
     }
 
-    Serial.printf("[RAW MQTT] publish msgCnt=%lu bytes=%d\r\n",
+    tdmDebugPrintf(2, "[RAW MQTT] publish msgCnt=%lu bytes=%d\r\n",
                   (unsigned long)msg_count, n);
     if (!rawMqttPublish(cfg.mqtt_topic, (const uint8_t *)payload, (size_t)n)) {
         setMQTTState(false);
@@ -1067,18 +1055,61 @@ bool TDM2421MQTT::publishSnapshot()
         xSemaphoreGive(state_mutex);
     }
     setError("");
-    // Avoid dumping ~1 kB of JSON ten times per second; that logging alone can
-    // perturb timing. Keep a lightweight 1 Hz health message instead.
-    if ((msg_count % 10U) == 0U) {
-        const uint32_t now_ms = millis();
-        uint32_t dt10 = mqtt_rate_last_ms == 0 ? 0 : (uint32_t)(now_ms - mqtt_rate_last_ms);
-        float hz = dt10 > 0 ? (10000.0f / (float)dt10) : 0.0f;
-        mqtt_rate_last_ms = now_ms;
-        Serial.printf("[RAW MQTT] stream msgCnt=%lu bytes=%d rate=%.2f Hz sendOK=%lu sendErr=%lu\r\n",
-                      (unsigned long)msg_count, n, hz,
-                      (unsigned long)raw_send_ok,
-                      (unsigned long)raw_send_error);
+    // In log trạng thái tổng hợp mỗi 1 giây/lần (không phụ thuộc MQTT_HZ) và tự bỏ qua
+    // nếu không mở Serial Monitor để tránh nghẽn USB CDC.
+#if TDM2421_DEBUG_LEVEL > 0
+    static uint32_t status_last_ms = 0;
+    static uint32_t status_last_count = 0;
+    const uint32_t status_now_ms = millis();
+    if (status_last_ms == 0) {
+        status_last_ms = status_now_ms;
+        status_last_count = msg_count;
+    } else if ((uint32_t)(status_now_ms - status_last_ms) >= 1000U) {
+        const uint32_t dt = (uint32_t)(status_now_ms - status_last_ms);
+        const uint32_t dn = (uint32_t)(msg_count - status_last_count);
+        const float hz = dt > 0 ? ((float)dn * 1000.0f / (float)dt) : 0.0f;
+        status_last_ms = status_now_ms;
+        status_last_count = msg_count;
+
+        TDM2421GNSSFix status_gnss {};
+        const bool status_gnss_valid = getGNSSFix(status_gnss, 10000);
+
+        char gnss_text[64];
+        if (!status_gnss_valid) {
+            snprintf(gnss_text, sizeof(gnss_text),
+                     "NO_FIX sats=%u",
+                     (unsigned)status_gnss.satellites);
+        } else if (status_gnss.fix_type >= 3) {
+            snprintf(gnss_text, sizeof(gnss_text),
+                     "3D sats=%u hdop=%.1f",
+                     (unsigned)status_gnss.satellites,
+                     status_gnss.hdop);
+        } else if (status_gnss.fix_type == 2) {
+            snprintf(gnss_text, sizeof(gnss_text),
+                     "2D sats=%u hdop=%.1f",
+                     (unsigned)status_gnss.satellites,
+                     status_gnss.hdop);
+        } else {
+            snprintf(gnss_text, sizeof(gnss_text),
+                     "SEARCH sats=%u",
+                     (unsigned)status_gnss.satellites);
+        }
+
+        tdmDebugPrintf(1,
+            "[STATUS] MQTT=%.2fHz sent=%lu sendErr=%lu GNSS=%s LTE=%d dBm\r\n",
+            hz, (unsigned long)msg_count, (unsigned long)raw_send_error,
+            gnss_text, local_rssi_dbm);
+
+        tdmDebugPrintf(2,
+            "[TIME DEBUG] unix_base=%llu millis_base=%lu millis_now=%lu delta=%lu ts=%llu bytes=%d sendOK=%lu\r\n",
+            (unsigned long long)unix_base_ms,
+            (unsigned long)millis_base,
+            (unsigned long)millis_now,
+            (unsigned long)time_delta_ms,
+            (unsigned long long)ts, n,
+            (unsigned long)raw_send_ok);
     }
+#endif
     return true;
 }
 
@@ -1096,7 +1127,7 @@ void TDM2421MQTT::refreshSignal()
             signal_quality_csq = csq;
             xSemaphoreGive(state_mutex);
         }
-        Serial.printf("[LTE] CSQ=%d RSSI=%d dBm\r\n", csq, dbm);
+        tdmDebugPrintf(2, "[LTE] CSQ=%d RSSI=%d dBm\r\n", csq, dbm);
     }
 }
 
@@ -1105,7 +1136,7 @@ void TDM2421MQTT::handleReconfigure()
     if (!reconfigure_requested) return;
     reconfigure_requested = false;
 
-    Serial.println("[RAW MQTT] configuration changed; reconnecting LTE/MQTT");
+    tdmDebugPrintln(1, "[RAW MQTT] configuration changed; reconnecting LTE/MQTT");
     sendAT("AT+QMTDISC=0", 800);
     sendAT("AT+QMTCLOSE=0", 800);
     sendAT("AT+QICLOSE=0", 800);

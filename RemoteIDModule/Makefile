@@ -62,15 +62,21 @@ CUAV-RID: ArduRemoteID-CUAV_RID.bin
 #   make tdm2421 MQTT_HZ=2    # 2 Hz  (500 ms)
 #   make tdm2421 MQTT_HZ=1    # 1 Hz  (1000 ms)
 #   make tdm2421 MQTT_HZ=0    # use NVS/Web dashboard pub_ms instead
-# Valid fixed-rate range is 1..10 Hz.
+# Valid fixed-rate range is 1..30 Hz.
 MQTT_HZ ?= 10
 
+# Mức log USB CDC cho TDM2421 (không chặn khi rút cáp USB):
+#   0 = production: tắt log định kỳ
+#   1 = mặc định: chỉ in trạng thái 1 Hz và các mốc quan trọng
+#   2 = chi tiết: in toàn bộ lệnh AT/MQTT/GPS (vẫn tự bỏ qua nếu không mở Serial Monitor)
+DEBUG_LEVEL ?= 1
+
 tdm2421:
-	$(MAKE) -B ArduRemoteID-TDM2421.bin MQTT_HZ=$(MQTT_HZ)
+	$(MAKE) -B ArduRemoteID-TDM2421.bin MQTT_HZ=$(MQTT_HZ) DEBUG_LEVEL=$(DEBUG_LEVEL)
 
 ArduRemoteID-TDM2421.bin: CHIP=esp32c3
 ArduRemoteID-TDM2421.bin: ESP32_FQBN=esp32:esp32:esp32c3:CDCOnBoot=cdc,FlashMode=dio,PartitionScheme=min_spiffs
-ArduRemoteID-TDM2421.bin: EXTRA_BUILD_FLAGS=-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1 -DTDM2421_MQTT_HZ=$(MQTT_HZ)
+ArduRemoteID-TDM2421.bin: EXTRA_BUILD_FLAGS=-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1 -DTDM2421_MQTT_HZ=$(MQTT_HZ) -DTDM2421_DEBUG_LEVEL=$(DEBUG_LEVEL)
 ArduRemoteID-TDM2421.bin: APP_PARTITION_SIZE=1966080
 
 setup:
@@ -129,5 +135,5 @@ esp32c3dev-test:
 	$(MAKE) -B ArduRemoteID-ESP32C3_DEV.bin CHIP=esp32c3 EXTRA_BUILD_FLAGS="-DENABLE_RID_FAKE_TEST"
 
 tdm2421-test:
-	$(MAKE) -B ArduRemoteID-TDM2421.bin CHIP=esp32c3 MQTT_HZ=$(MQTT_HZ) EXTRA_BUILD_FLAGS="-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1 -DTDM2421_MQTT_HZ=$(MQTT_HZ) -DENABLE_RID_FAKE_TEST"
+	$(MAKE) -B ArduRemoteID-TDM2421.bin CHIP=esp32c3 MQTT_HZ=$(MQTT_HZ) DEBUG_LEVEL=$(DEBUG_LEVEL) EXTRA_BUILD_FLAGS="-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1 -DTDM2421_MQTT_HZ=$(MQTT_HZ) -DTDM2421_DEBUG_LEVEL=$(DEBUG_LEVEL) -DENABLE_RID_FAKE_TEST"
 
