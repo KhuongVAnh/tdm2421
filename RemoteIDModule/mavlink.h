@@ -13,6 +13,12 @@ const char *mavlink_location_source_name(void);
 bool mavlink_fc_connected(void);
 String mavlink_fc_status_json(void);
 
+#if defined(BOARD_TDM2421)
+// Giải mã từng byte từ luồng MQTT C2 uplink thành frame MAVLink hợp lệ (đã kiểm tra CRC X.25).
+// Trả về true khi hoàn tất 1 frame hợp lệ; bad_crc = true nếu frame bị lỗi checksum.
+bool mavlink_parse_c2_uplink_byte(uint8_t c, uint8_t *out_frame, uint16_t &out_len, bool &bad_crc);
+#endif
+
 /*
   abstraction for MAVLink on a serial port
  */

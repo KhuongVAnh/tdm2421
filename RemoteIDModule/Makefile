@@ -65,6 +65,14 @@ CUAV-RID: ArduRemoteID-CUAV_RID.bin
 # Valid fixed-rate range is 1..30 Hz.
 MQTT_HZ ?= 10
 
+# C2_HZ controls the fixed C2 downlink flush rate at build time (0 = use Web/NVS c2_batch_ms):
+#   make tdm2421 C2_HZ=30 RID_ENABLE=0
+C2_HZ ?= 30
+# RID_ENABLE controls whether Remote ID (Wi-Fi/BLE/MQTT JSON) runs alongside C2:
+#   0 = disable Remote ID temporarily to prioritize C2 bandwidth/CPU
+#   1 = enable Remote ID alongside C2
+RID_ENABLE ?= 0
+
 # Mức log USB CDC cho TDM2421 (không chặn khi rút cáp USB):
 #   0 = production: tắt log định kỳ
 #   1 = mặc định: chỉ in trạng thái 1 Hz và các mốc quan trọng
@@ -72,11 +80,11 @@ MQTT_HZ ?= 10
 DEBUG_LEVEL ?= 1
 
 tdm2421:
-	$(MAKE) -B ArduRemoteID-TDM2421.bin MQTT_HZ=$(MQTT_HZ) DEBUG_LEVEL=$(DEBUG_LEVEL)
+	$(MAKE) -B ArduRemoteID-TDM2421.bin MQTT_HZ=$(MQTT_HZ) C2_HZ=$(C2_HZ) RID_ENABLE=$(RID_ENABLE) DEBUG_LEVEL=$(DEBUG_LEVEL)
 
 ArduRemoteID-TDM2421.bin: CHIP=esp32c3
 ArduRemoteID-TDM2421.bin: ESP32_FQBN=esp32:esp32:esp32c3:CDCOnBoot=cdc,FlashMode=dio,PartitionScheme=min_spiffs
-ArduRemoteID-TDM2421.bin: EXTRA_BUILD_FLAGS=-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1 -DTDM2421_MQTT_HZ=$(MQTT_HZ) -DTDM2421_DEBUG_LEVEL=$(DEBUG_LEVEL)
+ArduRemoteID-TDM2421.bin: EXTRA_BUILD_FLAGS=-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1 -DTDM2421_MQTT_HZ=$(MQTT_HZ) -DTDM2421_C2_MAX_HZ=$(C2_HZ) -DTDM2421_ENABLE_RID=$(RID_ENABLE) -DTDM2421_DEBUG_LEVEL=$(DEBUG_LEVEL)
 ArduRemoteID-TDM2421.bin: APP_PARTITION_SIZE=1966080
 
 setup:

@@ -6,6 +6,10 @@
 #include "board_config.h"
 #include "version.h"
 #include "parameters.h"
+#if defined(BOARD_TDM2421)
+#include "tdm2421_c2.h"
+#include "tdm2421_mqtt.h"
+#endif
 
 #define SERIAL_BAUD 115200
 
@@ -171,6 +175,21 @@ void MAVLinkSerial::update(void)
 {
     const uint32_t now_ms = millis();
 
+#if defined(BOARD_TDM2421)
+    // Đảm bảo chỉ duy nhất loop() (thông qua mavlink1 trên MAVLINK_COMM_0) ghi ra Serial1.
+    // Xả tối đa 4 frame lệnh C2 từ MQTT xuống FC mỗi vòng lặp để tránh đan xen byte với HEARTBEAT/ARM_STATUS.
+    if (chan == MAVLINK_COMM_0 && tdm2421_c2.isEnabled()) {
+        uint8_t c2_frame[TDM2421_C2_MAX_FRAME_LEN] {};
+        uint16_t c2_len = 0;
+        for (uint8_t i = 0; i < 4; i++) {
+            if (!tdm2421_c2.popUplinkFrame(c2_frame, c2_len)) {
+                break;
+            }
+            serial.write(c2_frame, c2_len);
+        }
+    }
+#endif
+
     if (mavlink_system.sysid != 0) {
         update_send();
     } else if (g.mavlink_sysid != 0) {
@@ -233,6 +252,16 @@ void MAVLinkSerial::update_receive(void)
         if (mavlink_parse_char(chan, c, &msg, &status)) {
             mav_rx_frames++;
             process_packet(status, msg);
+#if defined(BOARD_TDM2421)
+            // Chỉ đẩy vào C2 downlink khi đã nối xong MQTT để tránh đếm TXdrop giả lúc khởi động 4G.
+            if (chan == MAVLINK_COMM_0 && tdm2421_c2.isEnabled() &&
+                tdm2421_mqtt.isMqttConnected() &&
+                !(msg.sysid == mavlink_system.sysid && msg.compid == MAV_COMP_ID_ODID_TXRX_1)) {
+                uint8_t raw[MAVLINK_MAX_PACKET_LEN] {};
+                const uint16_t raw_len = mavlink_msg_to_send_buffer(raw, &msg);
+                tdm2421_c2.pushDownlinkFrame(raw, raw_len, millis());
+            }
+#endif
         }
     }
 
@@ -634,3 +663,32 @@ void MAVLinkSerial::arm_status_send(void)
         status,
         reason);
 }
+
+#if defined(BOARD_TDM2421)
+bool mavlink_parse_c2_uplink_byte(uint8_t c, uint8_t *out_frame, uint16_t &out_len, bool &bad_crc)
+{
+    out_len = 0;
+    bad_crc = false;
+    if (out_frame == nullptr) {
+        return false;
+    }
+    // Dùng bộ đệm & trạng thái tĩnh riêng biệt với MAVLINK_COMM_0 của Serial1
+    // để parse luồng byte từ MQTT C2 RX mà không xung đột với bộ thu FC.
+    static mavlink_message_t c2_rx_msg {};
+    static mavlink_status_t c2_rx_status {};
+    mavlink_message_t ready_msg {};
+    mavlink_status_t ready_status {};
+
+    const uint8_t res = mavlink_frame_char_buffer(
+        &c2_rx_msg, &c2_rx_status, c, &ready_msg, &ready_status);
+    if (res == MAVLINK_FRAMING_BAD_CRC) {
+        bad_crc = true;
+        return false;
+    }
+    if (res != MAVLINK_FRAMING_OK) {
+        return false;
+    }
+    out_len = mavlink_msg_to_send_buffer(out_frame, &ready_msg);
+    return out_len > 0 && out_len <= TDM2421_C2_MAX_FRAME_LEN;
+}
+#endif

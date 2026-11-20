@@ -25,6 +25,7 @@
 #include "efuse.h"
 #include "led.h"
 #include "tdm2421_mqtt.h"
+#include "tdm2421_c2.h"
 #include "tdm2421_debug.h"
 
 
@@ -194,6 +195,8 @@ void setup()
                   (unsigned)g.ua_type, (unsigned)g.id_type, g.uas_id);
 #endif
 
+    // Tăng RX ring buffer phần cứng UART để tránh tràn FIFO ở baudrate cao (đặc biệt EG800K @ 460800 bps).
+    Serial1.setRxBufferSize(1024);
     // Serial1 for Flight Controller MAVLink (TDM2421: GPIO 6 RX / GPIO 7 TX)
     Serial1.begin(g.baudrate, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
 
@@ -208,11 +211,15 @@ void setup()
     digitalWrite(PIN_SIM_DTR, HIGH);
     tdmDebugPrintf(1, "[TDM2421] SIM DTR: GPIO%d = HIGH\r\n", (int)PIN_SIM_DTR);
 
+    Serial0.setRxBufferSize(4096);
     Serial0.begin(SIM_UART_BAUD, SERIAL_8N1,
                   PIN_SIM_UART_RX, PIN_SIM_UART_TX);
     tdmDebugPrintf(1, "[TDM2421] EG800K UART started: baud=%u RX=GPIO%d TX=GPIO%d\r\n",
                   (unsigned)SIM_UART_BAUD,
                   (int)PIN_SIM_UART_RX, (int)PIN_SIM_UART_TX);
+
+    // Khởi tạo cầu nối C2 trước khi task LTE/MQTT bắt đầu chạy.
+    tdm2421_c2.begin();
 
     // Start LTE/MQTT worker task. It runs independently from the
     // timing-sensitive Remote ID WiFi/BLE loop.
@@ -572,6 +579,11 @@ void loop()
     status_mavlink_connected = mavlink_fc_connected() || mav_location_fresh;
     status_mavlink_age_ms = transport_last_location_ms == 0 ? 0 :
                             now_ms - transport_last_location_ms;
+#if defined(BOARD_TDM2421)
+    // Báo cho task MQTT biết FC đang cung cấp tọa độ MAVLink tươi để tạm giãn poll EG800K GNSS,
+    // dành toàn bộ băng thông UART0 cho đường truyền C2 và Remote ID.
+    tdm2421_mqtt.setMavLocationFresh(mav_location_fresh);
+#endif
 
     led.update();
     status_reason = "";
@@ -768,6 +780,7 @@ void loop()
     // IMPORTANT: submit to MQTT before bcast_powerup can temporarily force
     // LocationValid=1 for RID power-up broadcasts. MQTT must never publish
     // the OpenDroneID invalid sentinels (0/0, -1000 m, 255 m/s) as a real fix.
+#if TDM2421_ENABLE_RID
     if (selected_location_valid) {
         // Keep source diagnostics readable: report MQTT source only on a
         // source change or once per second, not on every loop/submission.
@@ -786,7 +799,9 @@ void loop()
         tdm2421_mqtt.submit(UAS_data, g.wifi_channel);
     }
 #endif
+#endif
 
+#if !defined(BOARD_TDM2421) || TDM2421_ENABLE_RID
     if (g.bcast_powerup) {
         if (!UAS_data.LocationValid) {
             UAS_data.Location.Status = ODID_STATUS_REMOTE_ID_SYSTEM_FAILURE;
@@ -807,9 +822,11 @@ void loop()
         }
 #endif
     }
+#endif // !BOARD_TDM2421 || TDM2421_ENABLE_RID
 
 #endif // RID_FAKE_TEST_MODE
 
+#if !defined(BOARD_TDM2421) || TDM2421_ENABLE_RID
     // -------------------------------------------------------------------------
     // Common Remote ID transmit section
     // Runs for both normal data and RID fake-test data.
@@ -843,6 +860,9 @@ void loop()
         last_update_bt4_ms = now_ms;
         ble.transmit_legacy(UAS_data);
     }
+#else
+    // Tạm thời tắt phát sóng Wi-Fi/BLE Remote ID khi TDM2421_ENABLE_RID == 0 để ưu tiên tối đa cho C2.
+#endif // !BOARD_TDM2421 || TDM2421_ENABLE_RID
 
     // sleep for a bit for power saving
     delay(1);

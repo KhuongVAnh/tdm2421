@@ -5,6 +5,8 @@
 
 #if defined(BOARD_TDM2421)
 
+#include "tdm2421_modem_rx.h"
+
 struct TDM2421GNSSFix {
     bool valid;
     double latitude;
@@ -41,12 +43,19 @@ struct TDM2421Config {
     char bandwidth[17];
     uint32_t publish_interval_ms;
     uint32_t reconnect_interval_ms;
+    bool c2_enable;
+    char c2_tx_topic[97];
+    char c2_rx_topic[97];
+    uint16_t c2_batch_ms;
 };
 
 class TDM2421MQTT {
 public:
     void begin();
     void submit(const ODID_UAS_Data &uas, uint8_t wifi_channel);
+    void setMavLocationFresh(bool fresh) { mav_location_fresh_flag = fresh; }
+    bool isMqttConnected() const { return mqtt_ok && raw_socket_ok; }
+    bool isC2Subscribed() const { return c2_subscribed; }
 
     // Runtime configuration stored in ESP32 NVS namespace "tdmnet".
     void getConfig(TDM2421Config &out);
@@ -71,12 +80,18 @@ private:
     bool rawTcpOpen();
     bool rawTcpSend(const uint8_t *data, size_t len, uint32_t timeout_ms = 1000);
     bool rawMqttConnect();
+    bool rawMqttSubscribe(const char *topic, uint16_t packet_id);
     bool rawMqttPublish(const char *topic, const uint8_t *payload, size_t payload_len);
-    void serviceRawSocket(uint32_t budget_ms = 2);
+    void pumpModemRX();
+    static void onMqttPublishEntry(const char *topic, size_t topic_len,
+                                   const uint8_t *payload, size_t payload_len, void *ctx);
+    void handleMqttPublish(const char *topic, size_t topic_len,
+                           const uint8_t *payload, size_t payload_len);
     static size_t mqttEncodeRemainingLength(uint32_t value, uint8_t *out, size_t out_len);
     static size_t mqttWriteUtf8(uint8_t *out, size_t out_len, const char *s);
     bool syncTime();
     bool publishSnapshot();
+    bool publishC2Downlink(const char *topic, const uint8_t *data, size_t len);
     void refreshSignal();
     void handleReconfigure();
     bool ensureGNSS();
@@ -87,7 +102,6 @@ private:
 
     String sendAT(const String &cmd, uint32_t timeout_ms = 2000);
     bool waitFor(const String &needle, uint32_t timeout_ms, String *capture = nullptr);
-    void clearRX();
 
     void loadConfig();
     void setError(const char *msg);
@@ -109,6 +123,11 @@ private:
     SemaphoreHandle_t config_mutex = nullptr;
     TDM2421Config config {};
     volatile bool reconfigure_requested = false;
+    volatile bool mav_location_fresh_flag = false;
+    volatile bool c2_subscribed = false;
+    uint32_t c2_last_batch_ms = 0;
+
+    TDM2421ModemRxDemux rx_demux {};
 
     SemaphoreHandle_t state_mutex = nullptr;
     SemaphoreHandle_t gnss_mutex = nullptr;

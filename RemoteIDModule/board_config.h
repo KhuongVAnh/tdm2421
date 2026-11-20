@@ -186,6 +186,17 @@
 
 #define TDM2421_HAS_EG800K 1
 
+// Chế độ test tối ưu độ mượt cho C2 trên TDM2421:
+//   - TDM2421_ENABLE_RID = 0: tạm thời tắt phát sóng Wi-Fi/BLE Remote ID và tắt publish JSON Remote ID
+//     lên MQTT (vẫn giữ Wi-Fi AP Web Dashboard để theo dõi/cấu hình). Đặt về 1 để bật lại Remote ID.
+//   - TDM2421_C2_MAX_HZ = 30: giới hạn/ưu tiên chu kỳ gom gửi C2 ở mức 30 Hz (33 ms/lần, ghi đè NVS).
+#ifndef TDM2421_ENABLE_RID
+#define TDM2421_ENABLE_RID 0
+#endif
+#ifndef TDM2421_C2_MAX_HZ
+#define TDM2421_C2_MAX_HZ 30
+#endif
+
 #else
 #error "unsupported board"
 #endif

@@ -3,7 +3,9 @@
 #if defined(BOARD_TDM2421)
 
 #include "board_config.h"
+#include "tdm2421_c2.h"
 #include "tdm2421_debug.h"
+#include "mavlink.h"
 #include <Preferences.h>
 #include <inttypes.h>
 
@@ -21,6 +23,20 @@ static const char *DEFAULT_MQTT_TOPIC   = "p3000m/data";
 static const char *DEFAULT_DEVICE_ID    = "TDM2421";
 static const char *DEFAULT_VERSION      = "V1.0";
 static const char *DEFAULT_BANDWIDTH    = "20MHz";
+static const bool DEFAULT_C2_ENABLE     = true;
+static const char *DEFAULT_C2_TX_TOPIC  = "p3000m/c2/tx";
+static const char *DEFAULT_C2_RX_TOPIC  = "p3000m/c2/rx";
+#if defined(TDM2421_C2_MAX_HZ) && TDM2421_C2_MAX_HZ > 0
+static const uint16_t BUILD_C2_BATCH_MS =
+    (uint16_t)((1000U + (TDM2421_C2_MAX_HZ / 2U)) / TDM2421_C2_MAX_HZ);
+static const uint16_t DEFAULT_C2_BATCH_MS = BUILD_C2_BATCH_MS;
+#else
+static const uint16_t DEFAULT_C2_BATCH_MS = 33;
+#endif
+static const uint16_t MIN_C2_BATCH_MS     = 20;
+static const uint16_t MAX_C2_BATCH_MS     = 500;
+// Giới hạn payload mỗi gói PUBLISH C2 tối đa 1300 B để cộng header + topic vẫn <= 1460 B (giới hạn AT+QISEND=0).
+static const size_t C2_BATCH_MAX_BYTES    = 1300;
 
 // Build-time MQTT publish-rate override.
 //   TDM2421_MQTT_HZ = 1..30 : force that rate, overriding NVS/Web setting.
@@ -92,6 +108,10 @@ void TDM2421MQTT::loadConfig()
     copyCString(cfg.bandwidth, DEFAULT_BANDWIDTH);
     cfg.publish_interval_ms = DEFAULT_PUBLISH_INTERVAL_MS;
     cfg.reconnect_interval_ms = DEFAULT_RECONNECT_INTERVAL_MS;
+    cfg.c2_enable = DEFAULT_C2_ENABLE;
+    copyCString(cfg.c2_tx_topic, DEFAULT_C2_TX_TOPIC);
+    copyCString(cfg.c2_rx_topic, DEFAULT_C2_RX_TOPIC);
+    cfg.c2_batch_ms = DEFAULT_C2_BATCH_MS;
 
     Preferences prefs;
     if (prefs.begin("tdmnet", false)) {
@@ -108,6 +128,10 @@ void TDM2421MQTT::loadConfig()
         copyString(cfg.bandwidth, prefs.getString("bandwidth", cfg.bandwidth));
         cfg.publish_interval_ms = prefs.getUInt("pub_ms", cfg.publish_interval_ms);
         cfg.reconnect_interval_ms = prefs.getUInt("recon_ms", cfg.reconnect_interval_ms);
+        cfg.c2_enable = prefs.getBool("c2_en", cfg.c2_enable);
+        copyString(cfg.c2_tx_topic, prefs.getString("c2_tx", cfg.c2_tx_topic));
+        copyString(cfg.c2_rx_topic, prefs.getString("c2_rx", cfg.c2_rx_topic));
+        cfg.c2_batch_ms = prefs.getUShort("c2_bms", cfg.c2_batch_ms);
 
         // Store defaults/current values so the namespace is fully initialised.
         prefs.putString("apn", cfg.apn);
@@ -123,6 +147,10 @@ void TDM2421MQTT::loadConfig()
         prefs.putString("bandwidth", cfg.bandwidth);
         prefs.putUInt("pub_ms", cfg.publish_interval_ms);
         prefs.putUInt("recon_ms", cfg.reconnect_interval_ms);
+        prefs.putBool("c2_en", cfg.c2_enable);
+        prefs.putString("c2_tx", cfg.c2_tx_topic);
+        prefs.putString("c2_rx", cfg.c2_rx_topic);
+        prefs.putUShort("c2_bms", cfg.c2_batch_ms);
 
         prefs.end();
     }
@@ -136,6 +164,17 @@ void TDM2421MQTT::loadConfig()
         cfg.publish_interval_ms = DEFAULT_PUBLISH_INTERVAL_MS;
 #endif
     if (cfg.reconnect_interval_ms < 1000) cfg.reconnect_interval_ms = DEFAULT_RECONNECT_INTERVAL_MS;
+    if (cfg.c2_tx_topic[0] == '\0') copyCString(cfg.c2_tx_topic, DEFAULT_C2_TX_TOPIC);
+    if (cfg.c2_rx_topic[0] == '\0') copyCString(cfg.c2_rx_topic, DEFAULT_C2_RX_TOPIC);
+#if defined(TDM2421_C2_MAX_HZ) && TDM2421_C2_MAX_HZ > 0
+    // Tần số C2 cấu hình tại build-time ghi đè giá trị c2_bms cũ trong NVS.
+    cfg.c2_batch_ms = BUILD_C2_BATCH_MS;
+#else
+    if (cfg.c2_batch_ms < MIN_C2_BATCH_MS || cfg.c2_batch_ms > MAX_C2_BATCH_MS) {
+        cfg.c2_batch_ms = DEFAULT_C2_BATCH_MS;
+    }
+#endif
+    tdm2421_c2.setEnabled(cfg.c2_enable);
 
 #if TDM2421_MQTT_HZ > 0
     tdmDebugPrintf(1, "[MQTT CONFIG] build rate=%u Hz interval=%lu ms (overrides NVS/Web)\r\n",
@@ -144,6 +183,12 @@ void TDM2421MQTT::loadConfig()
 #else
     tdmDebugPrintf(1, "[MQTT CONFIG] NVS/Web rate control interval=%lu ms\r\n",
                   (unsigned long)cfg.publish_interval_ms);
+#endif
+#if defined(TDM2421_C2_MAX_HZ) && TDM2421_C2_MAX_HZ > 0
+    tdmDebugPrintf(1, "[C2 CONFIG] RID=%s C2_MAX_HZ=%u batch=%u ms (overrides NVS/Web)\r\n",
+                  TDM2421_ENABLE_RID ? "ON" : "OFF",
+                  (unsigned)TDM2421_C2_MAX_HZ,
+                  (unsigned)cfg.c2_batch_ms);
 #endif
 
     if (config_mutex && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -172,6 +217,9 @@ bool TDM2421MQTT::saveConfig(const TDM2421Config &cfg)
     // Keep the make-time publish rate authoritative even if the Web form posts pub_ms.
     effective.publish_interval_ms = BUILD_PUBLISH_INTERVAL_MS;
 #endif
+#if defined(TDM2421_C2_MAX_HZ) && TDM2421_C2_MAX_HZ > 0
+    effective.c2_batch_ms = BUILD_C2_BATCH_MS;
+#endif
 
     if (effective.apn[0] == '\0' || effective.mqtt_host[0] == '\0' || effective.mqtt_port == 0 ||
         effective.mqtt_client[0] == '\0' || effective.mqtt_topic[0] == '\0' ||
@@ -179,6 +227,13 @@ bool TDM2421MQTT::saveConfig(const TDM2421Config &cfg)
         effective.publish_interval_ms > 60000 || effective.reconnect_interval_ms < 1000 ||
         effective.reconnect_interval_ms > 300000) {
         return false;
+    }
+    if (effective.c2_enable) {
+        if (effective.c2_tx_topic[0] == '\0' || effective.c2_rx_topic[0] == '\0' ||
+            strcmp(effective.c2_tx_topic, effective.c2_rx_topic) == 0 ||
+            effective.c2_batch_ms < MIN_C2_BATCH_MS || effective.c2_batch_ms > MAX_C2_BATCH_MS) {
+            return false;
+        }
     }
 
     Preferences prefs;
@@ -198,6 +253,10 @@ bool TDM2421MQTT::saveConfig(const TDM2421Config &cfg)
     prefs.putString("bandwidth", effective.bandwidth);
     prefs.putUInt("pub_ms", effective.publish_interval_ms);
     prefs.putUInt("recon_ms", effective.reconnect_interval_ms);
+    prefs.putBool("c2_en", effective.c2_enable);
+    prefs.putString("c2_tx", effective.c2_tx_topic);
+    prefs.putString("c2_rx", effective.c2_rx_topic);
+    prefs.putUShort("c2_bms", effective.c2_batch_ms);
     prefs.end();
 
     if (config_mutex && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -207,6 +266,7 @@ bool TDM2421MQTT::saveConfig(const TDM2421Config &cfg)
         return false;
     }
 
+    tdm2421_c2.setEnabled(effective.c2_enable);
     reconfigure_requested = true;
     return true;
 }
@@ -246,47 +306,105 @@ void TDM2421MQTT::taskEntry(void *arg)
     static_cast<TDM2421MQTT *>(arg)->task();
 }
 
-void TDM2421MQTT::clearRX()
+void TDM2421MQTT::onMqttPublishEntry(const char *topic, size_t topic_len,
+                                       const uint8_t *payload, size_t payload_len, void *ctx)
 {
+    if (ctx != nullptr) {
+        static_cast<TDM2421MQTT *>(ctx)->handleMqttPublish(topic, topic_len, payload, payload_len);
+    }
+}
+
+void TDM2421MQTT::handleMqttPublish(const char *topic, size_t topic_len,
+                                    const uint8_t *payload, size_t payload_len)
+{
+    TDM2421Config cfg {};
+    getConfig(cfg);
+    if (!cfg.c2_enable || topic == nullptr || payload == nullptr || payload_len == 0) {
+        return;
+    }
+    const size_t expected_len = strlen(cfg.c2_rx_topic);
+    if (topic_len != expected_len || memcmp(topic, cfg.c2_rx_topic, expected_len) != 0) {
+        return;
+    }
+
+    // Giải mã từng byte payload nhị phân qua parser MAVLink độc lập và kiểm tra CRC X.25.
+    // Chỉ frame hợp lệ mới được đưa vào hàng đợi uplink để loop() ghi xuống FC (Serial1).
+    uint8_t frame_buf[TDM2421_C2_MAX_FRAME_LEN] {};
+    uint16_t frame_len = 0;
+    uint16_t accepted = 0;
+    for (size_t i = 0; i < payload_len; i++) {
+        bool bad_crc = false;
+        if (mavlink_parse_c2_uplink_byte(payload[i], frame_buf, frame_len, bad_crc)) {
+            if (tdm2421_c2.pushUplinkFrame(frame_buf, frame_len, millis())) {
+                accepted++;
+            }
+        } else if (bad_crc) {
+            tdm2421_c2.recordRxInvalid();
+        }
+    }
+    if (accepted > 0) {
+        tdmDebugPrintf(2, "[C2 RX] accepted=%u frames bytes=%u\r\n",
+                      (unsigned)accepted, (unsigned)payload_len);
+    }
+}
+
+void TDM2421MQTT::pumpModemRX()
+{
+    // Duy nhất hàm này đọc Serial0: vừa hút URC nhị phân +QIURC: "recv" vào mqtt_ring,
+    // vừa giữ lại phản hồi text AT thuần cho sendAT()/waitFor() mà không bao giờ làm rớt lệnh C2.
+    const uint32_t now_ms = millis();
     while (Serial0.available()) {
-        Serial0.read();
+        const uint8_t b = (uint8_t)Serial0.read();
+        rx_demux.feedByte(b, now_ms);
+    }
+    rx_demux.checkTimeout(now_ms, 1000);
+
+    if (rx_demux.consumeSocketClosed()) {
+        raw_socket_ok = false;
+        c2_subscribed = false;
+        setMQTTState(false);
+        setError("Raw MQTT TCP socket closed");
+        tdmDebugPrintln(1, "[RAW MQTT] socket closed");
+    }
+    if (rx_demux.consumeProtocolError()) {
+        raw_socket_ok = false;
+        c2_subscribed = false;
+        setMQTTState(false);
+        setError("Modem RX stream error");
+        tdmDebugPrintln(1, "[RAW MQTT] modem RX stream desync/error");
+    }
+
+    rx_demux.processMqttPackets(onMqttPublishEntry, this);
+    if (rx_demux.takePingresp()) {
+        tdmDebugPrintln(2, "[RAW MQTT] PINGRESP");
     }
 }
 
 String TDM2421MQTT::sendAT(const String &cmd, uint32_t timeout_ms)
 {
-    // Read only until the modem has returned a final result code.
-    // The old implementation always waited for the complete timeout (e.g.
-    // QGPSLOC waited 900 ms even when the reply arrived in a few ms), which
-    // made a 100 ms MQTT scheduler impossible.
-    clearRX();
+    // Hút sạch byte tồn đọng qua demuxer trước khi xoá phần text AT cũ
+    // (tuyệt đối không xoá mqtt_ring để tránh mất gói lệnh C2 đang chờ).
+    pumpModemRX();
+    rx_demux.clearATText();
     tdmDebugPrintf(2, "[EG800K] >> %s\r\n", cmd.c_str());
     Serial0.println(cmd);
 
-    String out;
     const uint32_t start = millis();
     while (millis() - start < timeout_ms) {
-        bool received = false;
-        while (Serial0.available()) {
-            received = true;
-            char c = (char)Serial0.read();
-            out += c;
-            if (out.length() > 2048) {
-                out.remove(0, 1024);
-            }
-        }
+        const size_t before = rx_demux.atLength();
+        pumpModemRX();
+        const bool received = (rx_demux.atLength() != before);
 
-        // Quectel AT commands used here return their data first, then OK/ERROR.
-        // Exit immediately on the final result instead of burning timeout_ms.
-        if (out.indexOf("\r\nOK\r\n") >= 0 ||
-            out.indexOf("\nOK\r") >= 0 ||
-            out.indexOf("\r\nERROR\r\n") >= 0 ||
-            out.indexOf("+CME ERROR:") >= 0) {
+        if (rx_demux.atContains("\r\nOK\r\n") ||
+            rx_demux.atContains("\nOK\r") ||
+            rx_demux.atContains("\r\nERROR\r\n") ||
+            rx_demux.atContains("+CME ERROR:")) {
             break;
         }
 
         if (!received) delay(1);
     }
+    String out(rx_demux.atText());
     if (out.length()) {
         tdmDebugPrintf(2, "[EG800K] << %s\r\n", out.c_str());
     }
@@ -295,30 +413,23 @@ String TDM2421MQTT::sendAT(const String &cmd, uint32_t timeout_ms)
 
 bool TDM2421MQTT::waitFor(const String &needle, uint32_t timeout_ms, String *capture)
 {
-    String buf;
     const uint32_t start = millis();
     while (millis() - start < timeout_ms) {
-        while (Serial0.available()) {
-            char c = (char)Serial0.read();
-            buf += c;
-            if (buf.indexOf(needle) >= 0) {
-                if (capture) *capture = buf;
-                tdmDebugPrintf(2, "[EG800K] << %s\r\n", buf.c_str());
-                return true;
-            }
-            if (buf.indexOf("ERROR") >= 0) {
-                if (capture) *capture = buf;
-                tdmDebugPrintf(2, "[EG800K] << %s\r\n", buf.c_str());
-                return false;
-            }
-            if (buf.length() > 4096) {
-                buf.remove(0, 2048);
-            }
+        pumpModemRX();
+        if (rx_demux.atContains(needle.c_str())) {
+            if (capture) *capture = String(rx_demux.atText());
+            tdmDebugPrintf(2, "[EG800K] << %s\r\n", rx_demux.atText());
+            return true;
+        }
+        if (rx_demux.atContains("ERROR")) {
+            if (capture) *capture = String(rx_demux.atText());
+            tdmDebugPrintf(2, "[EG800K] << %s\r\n", rx_demux.atText());
+            return false;
         }
         delay(1);
     }
-    if (capture) *capture = buf;
-    if (buf.length()) tdmDebugPrintf(2, "[EG800K] << %s\r\n", buf.c_str());
+    if (capture) *capture = String(rx_demux.atText());
+    if (rx_demux.atLength() > 0) tdmDebugPrintf(2, "[EG800K] << %s\r\n", rx_demux.atText());
     return false;
 }
 
@@ -338,12 +449,18 @@ void TDM2421MQTT::setError(const String &msg)
 void TDM2421MQTT::setNetworkState(bool value)
 {
     network_ok = value;
-    if (!value) mqtt_ok = false;
+    if (!value) {
+        mqtt_ok = false;
+        c2_subscribed = false;
+    }
 }
 
 void TDM2421MQTT::setMQTTState(bool value)
 {
     mqtt_ok = value;
+    if (!value) {
+        c2_subscribed = false;
+    }
 }
 
 bool TDM2421MQTT::getGNSSFix(TDM2421GNSSFix &out, uint32_t max_age_ms)
@@ -655,7 +772,8 @@ bool TDM2421MQTT::rawTcpOpen()
     // Socket 0 is dedicated to raw MQTT over TCP. Direct-push mode (1) keeps
     // the UART in AT command mode, so GNSS/CSQ can still share Serial0.
     sendAT("AT+QICLOSE=0", 800);
-    clearRX();
+    rx_demux.resetMqttStream();
+    rx_demux.clearATText();
 
     String cmd = "AT+QIOPEN=1,0,\"TCP\",\"" + String(cfg.mqtt_host) +
                  "\"," + String(cfg.mqtt_port) + ",0,1";
@@ -701,9 +819,10 @@ bool TDM2421MQTT::rawTcpSend(const uint8_t *data, size_t len, uint32_t timeout_m
 {
     if (!raw_socket_ok || data == nullptr || len == 0 || len > 1460U) return false;
 
-    // Drain late socket URCs before starting a length-delimited send.
-    serviceRawSocket(1);
-    clearRX();
+    // Hút sạch URC đang chờ vào mqtt_ring rồi chỉ xoá phần text AT cũ trước QISEND.
+    pumpModemRX();
+    if (!raw_socket_ok) return false;
+    rx_demux.clearATText();
 
     String cmd = "AT+QISEND=0," + String((unsigned int)len);
     Serial0.println(cmd);
@@ -715,6 +834,8 @@ bool TDM2421MQTT::rawTcpSend(const uint8_t *data, size_t len, uint32_t timeout_m
         return false;
     }
 
+    // Xoá ">" trước khi chờ "SEND OK" và gửi payload nhị phân.
+    rx_demux.clearATText();
     Serial0.write(data, len);
 
     // SEND OK means the modem accepted the bytes for the TCP peer. This is
@@ -771,37 +892,71 @@ bool TDM2421MQTT::rawMqttConnect()
 
     if (!rawTcpSend(packet, 1 + rl + pos, 1500)) return false;
 
-    // In direct-push mode the broker CONNACK arrives after a textual +QIURC
-    // header. Scan the raw UART bytes for MQTT CONNACK = 20 02 00 00 so the
-    // embedded NUL bytes are handled correctly (Arduino String is unsuitable
-    // for binary framing).
-    String text_rx;
-    uint8_t win[4] = {0,0,0,0};
-    size_t win_count = 0;
+    // Đọc gói CONNACK thông qua bộ tách nhị phân + MQTT parser thay vì quét trực tiếp Serial0.
     const uint32_t start = millis();
     while ((uint32_t)(millis() - start) < 5000U) {
-        while (Serial0.available()) {
-            const uint8_t c = (uint8_t)Serial0.read();
-            if (win_count < 4) {
-                win[win_count++] = c;
-            } else {
-                win[0] = win[1]; win[1] = win[2]; win[2] = win[3]; win[3] = c;
-            }
-            if (win_count == 4 && win[0] == 0x20 && win[1] == 0x02 &&
-                win[2] == 0x00 && win[3] == 0x00) {
+        pumpModemRX();
+        if (!raw_socket_ok) break;
+        uint8_t rc = 0xFF;
+        if (rx_demux.takeConnack(rc)) {
+            if (rc == 0x00) {
                 tdmDebugPrintln(1, "[RAW MQTT] CONNACK accepted");
                 return true;
             }
-            if (c >= 0x20 && c <= 0x7E) {
-                text_rx += (char)c;
-                if (text_rx.length() > 256) text_rx.remove(0, 128);
-            }
+            tdmDebugPrintf(1, "[RAW MQTT] CONNACK rejected rc=0x%02X\r\n", (unsigned)rc);
+            return false;
         }
-        if (text_rx.indexOf("closed") >= 0 || text_rx.indexOf("NO CARRIER") >= 0) break;
-        delay(1);
+        delay(2);
     }
 
-    tdmDebugPrintln(1, "[RAW MQTT] CONNACK timeout/rejected");
+    tdmDebugPrintln(1, "[RAW MQTT] CONNACK timeout");
+    return false;
+}
+
+bool TDM2421MQTT::rawMqttSubscribe(const char *topic, uint16_t packet_id)
+{
+    if (!topic || topic[0] == '\0') return false;
+    const size_t topic_len = strlen(topic);
+    // Variable header (2B packet_id) + Payload (2B topic_len + topic + 1B requested QoS0).
+    const uint32_t remaining = (uint32_t)(2U + 2U + topic_len + 1U);
+
+    uint8_t packet[160];
+    size_t pos = 0;
+    packet[pos++] = 0x82; // SUBSCRIBE (flags = 0010b theo MQTT 3.1.1)
+    uint8_t rl[4];
+    const size_t rl_len = mqttEncodeRemainingLength(remaining, rl, sizeof(rl));
+    if (!rl_len || pos + rl_len + remaining > sizeof(packet)) return false;
+    memcpy(packet + pos, rl, rl_len);
+    pos += rl_len;
+
+    packet[pos++] = (uint8_t)((packet_id >> 8) & 0xFFU);
+    packet[pos++] = (uint8_t)(packet_id & 0xFFU);
+    packet[pos++] = (uint8_t)((topic_len >> 8) & 0xFFU);
+    packet[pos++] = (uint8_t)(topic_len & 0xFFU);
+    memcpy(packet + pos, topic, topic_len);
+    pos += topic_len;
+    packet[pos++] = 0x00; // QoS 0
+
+    if (!rawTcpSend(packet, pos, 1500)) return false;
+
+    const uint32_t start = millis();
+    while ((uint32_t)(millis() - start) < 3000U) {
+        pumpModemRX();
+        if (!raw_socket_ok) break;
+        uint16_t ack_pid = 0;
+        uint8_t rc = 0x80;
+        if (rx_demux.takeSuback(ack_pid, rc)) {
+            if (ack_pid == packet_id && rc != 0x80U) {
+                tdmDebugPrintf(1, "[C2 MQTT] SUBACK ok topic='%s' qos=%u\r\n", topic, (unsigned)rc);
+                return true;
+            }
+            tdmDebugPrintf(1, "[C2 MQTT] SUBACK rejected pid=%u rc=0x%02X\r\n",
+                          (unsigned)ack_pid, (unsigned)rc);
+            return false;
+        }
+        delay(2);
+    }
+    tdmDebugPrintln(1, "[C2 MQTT] SUBACK timeout");
     return false;
 }
 
@@ -811,7 +966,7 @@ bool TDM2421MQTT::rawMqttPublish(const char *topic, const uint8_t *payload, size
     const size_t topic_len = strlen(topic);
     const uint32_t remaining = (uint32_t)(2U + topic_len + payload_len);
 
-    uint8_t packet[1200];
+    uint8_t packet[1460];
     size_t pos = 0;
     packet[pos++] = 0x30; // PUBLISH, QoS0, retain=0
     uint8_t rl[4];
@@ -826,35 +981,32 @@ bool TDM2421MQTT::rawMqttPublish(const char *topic, const uint8_t *payload, size
     memcpy(packet + pos, payload, payload_len);
     pos += payload_len;
 
-    return rawTcpSend(packet, pos, 500);
+    if (!rawTcpSend(packet, pos, 500)) return false;
+    mqtt_last_ping_ms = millis();
+    return true;
 }
 
-void TDM2421MQTT::serviceRawSocket(uint32_t budget_ms)
+bool TDM2421MQTT::publishC2Downlink(const char *topic, const uint8_t *data, size_t len)
 {
-    if (!Serial0.available()) return;
-    String rx;
-    rx.reserve(192);
-    const uint32_t start = millis();
-    while ((uint32_t)(millis() - start) < budget_ms) {
-        while (Serial0.available()) {
-            char c = (char)Serial0.read();
-            rx += c;
-            if (rx.length() > 384) rx.remove(0, 192);
-        }
-        delay(0);
-    }
-    if (rx.indexOf("+QIURC: \"closed\",0") >= 0 ||
-        rx.indexOf("NO CARRIER") >= 0) {
-        raw_socket_ok = false;
+    if (!rawMqttPublish(topic, data, len)) {
         setMQTTState(false);
-        setError("Raw MQTT TCP socket closed");
-        tdmDebugPrintln(1, "[RAW MQTT] socket closed");
+        setError("C2 MQTT publish failed");
+        return false;
     }
+    return true;
 }
 
 bool TDM2421MQTT::ensureMQTT()
 {
     if (mqtt_ok && raw_socket_ok) return true;
+
+    TDM2421Config cfg {};
+    getConfig(cfg);
+
+    // Xoá dữ liệu tồn đọng cũ từ lúc mất mạng để tránh xả backlog lỗi thời ngay khi nối lại.
+    tdm2421_c2.clearDownlinkBacklog();
+    tdm2421_c2.clearUplinkQueue();
+    c2_subscribed = false;
 
     // Stop the modem's internal MQTT client so only the raw TCP implementation
     // owns this broker connection.
@@ -869,8 +1021,20 @@ bool TDM2421MQTT::ensureMQTT()
         return false;
     }
 
+    if (cfg.c2_enable && cfg.c2_rx_topic[0] != '\0') {
+        if (++mqtt_msg_id == 0) mqtt_msg_id = 1;
+        if (!rawMqttSubscribe(cfg.c2_rx_topic, mqtt_msg_id)) {
+            sendAT("AT+QICLOSE=0", 800);
+            raw_socket_ok = false;
+            setError("C2 MQTT SUBSCRIBE failed");
+            return false;
+        }
+        c2_subscribed = true;
+    }
+
     setMQTTState(true);
     mqtt_last_ping_ms = millis();
+    c2_last_batch_ms = millis();
     setError("");
     tdmDebugPrintln(1, "[RAW MQTT] connected");
     return true;
@@ -1185,6 +1349,10 @@ String TDM2421MQTT::configJson()
     s += "\"bandwidth\":\"" + jsonEscape(cfg.bandwidth) + "\",";
     s += "\"publishIntervalMs\":" + String(cfg.publish_interval_ms) + ",";
     s += "\"reconnectIntervalMs\":" + String(cfg.reconnect_interval_ms) + ",";
+    s += "\"c2Enable\":" + String(cfg.c2_enable ? "true" : "false") + ",";
+    s += "\"c2TxTopic\":\"" + jsonEscape(cfg.c2_tx_topic) + "\",";
+    s += "\"c2RxTopic\":\"" + jsonEscape(cfg.c2_rx_topic) + "\",";
+    s += "\"c2BatchMs\":" + String(cfg.c2_batch_ms) + ",";
     s += "\"passwordStored\":" + String(strlen(cfg.mqtt_pass) > 0 ? "true" : "false");
     s += "}";
     return s;
@@ -1225,6 +1393,7 @@ String TDM2421MQTT::statusJson()
     s += "\"lteRegistered\":" + String(local_reg ? "true" : "false") + ",";
     s += "\"pdpActive\":" + String(local_net ? "true" : "false") + ",";
     s += "\"mqttConnected\":" + String(local_mqtt ? "true" : "false") + ",";
+    s += "\"c2Subscribed\":" + String(c2_subscribed ? "true" : "false") + ",";
     s += "\"timeSynced\":" + String(local_time ? "true" : "false") + ",";
     s += "\"lteIp\":\"" + jsonEscape(local_ip) + "\",";
     s += "\"rssiDbm\":" + String(local_rssi) + ",";
@@ -1235,6 +1404,9 @@ String TDM2421MQTT::statusJson()
     s += "\"lastError\":\"" + jsonEscape(local_err) + "\",";
     s += "\"broker\":\"" + jsonEscape(String(cfg.mqtt_host) + ":" + String(cfg.mqtt_port)) + "\",";
     s += "\"topic\":\"" + jsonEscape(cfg.mqtt_topic) + "\",";
+    s += "\"c2TxTopic\":\"" + jsonEscape(cfg.c2_tx_topic) + "\",";
+    s += "\"c2RxTopic\":\"" + jsonEscape(cfg.c2_rx_topic) + "\",";
+    s += "\"c2BatchMs\":" + String(cfg.c2_batch_ms) + ",";
     s += "\"deviceId\":\"" + jsonEscape(cfg.device_id) + "\",";
     s += "\"uavSerial\":\"" + jsonEscape(cfg.uav_serial) + "\",";
     TDM2421GNSSFix gf {};
@@ -1325,10 +1497,75 @@ void TDM2421MQTT::task()
             if (syncTime()) last_time_sync = now;
         }
 
-        // MQTT is the highest-priority user of the modem UART. Use deadline
-        // scheduling (increment by the period, rather than resetting to `now`)
-        // to avoid long-term drift. If we fall more than one period behind,
-        // resynchronise instead of trying to burst old samples.
+        // Luôn bơm dữ liệu từ Serial0 qua demuxer trước để nhận tức thì lệnh C2 uplink từ MQTT.
+        pumpModemRX();
+        if (!network_ok || !mqtt_ok || !raw_socket_ok) {
+            delay(5);
+            continue;
+        }
+
+        // Ưu tiên 1 (trên đường 4G): chạy cố định theo chu kỳ tick c2_batch_ms (mặc định 33 ms ~ 30 Hz).
+        // Đến hạn tick, hoán đổi cặp Ping-Pong Double Buffer trong vài microsecond rồi gửi toàn bộ
+        // Send Buffer lên MQTT; trong lúc gửi, loop() vẫn ghi frame mới từ FC vào Fill Buffer còn lại.
+        static uint32_t c2_stat_last_ms = 0;
+        static uint32_t c2_stat_pubs = 0;
+        static uint32_t c2_stat_frames = 0;
+        static uint32_t c2_stat_bytes = 0;
+        if (cfg.c2_enable && cfg.c2_tx_topic[0] != '\0' &&
+            (uint32_t)(now - c2_last_batch_ms) >= cfg.c2_batch_ms) {
+            if (c2_last_batch_ms == 0 ||
+                (uint32_t)(now - c2_last_batch_ms) >= 2U * cfg.c2_batch_ms) {
+                c2_last_batch_ms = now;
+            } else {
+                c2_last_batch_ms += cfg.c2_batch_ms;
+            }
+
+            if (tdm2421_c2.swapDownlinkForSend() > 0U) {
+                uint8_t c2_batch[C2_BATCH_MAX_BYTES];
+                for (;;) {
+                    uint16_t c2_frames = 0;
+                    const size_t batch_len = tdm2421_c2.popSendBatch(
+                        c2_batch, sizeof(c2_batch), &c2_frames);
+                    if (batch_len == 0) {
+                        break;
+                    }
+                    if (!publishC2Downlink(cfg.c2_tx_topic, c2_batch, batch_len)) {
+                        break;
+                    }
+                    c2_stat_pubs++;
+                    c2_stat_frames += c2_frames;
+                    c2_stat_bytes += (uint32_t)batch_len;
+                    pumpModemRX();
+                }
+            }
+        }
+
+#if TDM2421_DEBUG_LEVEL > 0 && !TDM2421_ENABLE_RID
+        if (c2_stat_last_ms == 0) {
+            c2_stat_last_ms = now;
+        } else if ((uint32_t)(now - c2_stat_last_ms) >= 1000U) {
+            const uint32_t dt = (uint32_t)(now - c2_stat_last_ms);
+            const float pub_hz = dt > 0 ? ((float)c2_stat_pubs * 1000.0f / (float)dt) : 0.0f;
+            const TDM2421C2Stats cst = tdm2421_c2.getStats();
+            tdmDebugPrintf(1,
+                "[C2 STAT] pub=%.1fHz (%lu frames, %lu B/s) rx=%lu txDrop=%lu sendErr=%lu\r\n",
+                pub_hz,
+                (unsigned long)c2_stat_frames,
+                (unsigned long)(dt > 0 ? (c2_stat_bytes * 1000UL / dt) : 0UL),
+                (unsigned long)cst.rxFrames,
+                (unsigned long)cst.txDropped,
+                (unsigned long)raw_send_error);
+            c2_stat_last_ms = now;
+            c2_stat_pubs = 0;
+            c2_stat_frames = 0;
+            c2_stat_bytes = 0;
+        }
+#else
+        (void)c2_stat_last_ms; (void)c2_stat_pubs; (void)c2_stat_frames; (void)c2_stat_bytes;
+#endif
+
+#if TDM2421_ENABLE_RID
+        // Ưu tiên 2: publish JSON Remote ID theo chu kỳ deadline định sẵn.
         if ((uint32_t)(now - last_publish) >= cfg.publish_interval_ms) {
             if (last_publish == 0 || (uint32_t)(now - last_publish) >= 2U * cfg.publish_interval_ms) {
                 last_publish = now;
@@ -1336,29 +1573,30 @@ void TDM2421MQTT::task()
                 last_publish += cfg.publish_interval_ms;
             }
             publishSnapshot();
+            pumpModemRX();
             delay(1);
             continue;
         }
+#else
+        (void)last_publish; // Tạm tắt publish JSON Remote ID để tối ưu băng thông cho C2 30 Hz.
+#endif
 
-        // Check raw TCP socket URCs between publish deadlines.
-        serviceRawSocket(1);
-
-        // MQTT keepalive: a QoS0 PUBLISH counts as traffic, so PINGREQ is only
-        // needed when no publish has occurred for a long interval.
-        if ((uint32_t)(now - mqtt_last_ping_ms) >= 30000U &&
-            (uint32_t)(now - last_publish) >= 25000U) {
+        // Keepalive MQTT khi hoàn toàn không có gói RID hay C2 nào đi qua trong 30 giây.
+        if ((uint32_t)(now - mqtt_last_ping_ms) >= 30000U) {
             const uint8_t pingreq[2] = {0xC0, 0x00};
             if (rawTcpSend(pingreq, sizeof(pingreq), 500)) {
-                mqtt_last_ping_ms = now;
+                mqtt_last_ping_ms = millis();
             }
         }
 
-        // Low-rate housekeeping only runs between MQTT deadlines. Both commands
-        // use the same UART as MQTT, so they must never be checked before publish.
-        if (modem_seen && now - last_gnss >= GNSS_REFRESH_INTERVAL_MS) {
+#if TDM2421_ENABLE_RID
+        // Housekeeping tần suất thấp: chỉ poll EG800K GNSS khi FC không cung cấp tọa độ MAVLink tươi
+        // để nhường toàn bộ băng thông UART0 cho đường truyền C2.
+        if (modem_seen && !mav_location_fresh_flag && now - last_gnss >= GNSS_REFRESH_INTERVAL_MS) {
             last_gnss = now;
             refreshGNSS();
         }
+#endif
 
         if (now - last_signal >= SIGNAL_REFRESH_INTERVAL_MS) {
             last_signal = now;

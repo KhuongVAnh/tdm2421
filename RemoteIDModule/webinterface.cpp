@@ -12,6 +12,7 @@
 #include "status.h"
 #if defined(BOARD_TDM2421)
 #include "tdm2421_mqtt.h"
+#include "tdm2421_c2.h"
 #include "mavlink.h"
 #include "tdm2421_debug.h"
 #endif
@@ -120,7 +121,7 @@ static String tdmDashboardHtml()
     tdm2421_mqtt.getConfig(cfg);
 
     String h;
-    h.reserve(22000);
+    h.reserve(26000);
     h += F("<!doctype html><html><head><meta charset='utf-8'>");
     h += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
     h += F("<title>TDM2421 Control</title><style>");
@@ -220,6 +221,20 @@ static String tdmDashboardHtml()
            "</div></div>"
            "<p class='note' id='fc_msg'>Lưu vào NVS (BAUDRATE) và áp dụng ngay cho UART1 (GPIO 6 RX / GPIO 7 TX) không cần reboot.</p></div>");
 
+    // Thẻ giám sát đường truyền C2 (Raw MAVLink-over-MQTT 2 chiều).
+    h += F("<div class='card'><h3>Đường truyền C2 (MAVLink-over-MQTT)</h3>"
+           "<div class='two'><div>"
+           "<div class='row'><span>Trạng thái C2</span><span class='v' id='c2_en'></span></div>"
+           "<div class='row'><span>Subscribe RX Topic</span><span class='v' id='c2_sub'></span></div>"
+           "<div class='row'><span>Topic TX (FC -> GCS)</span><span class='v' id='c2_tx_t'></span></div>"
+           "<div class='row'><span>Topic RX (GCS -> FC)</span><span class='v' id='c2_rx_t'></span></div>"
+           "</div><div>"
+           "<div class='row'><span>Downlink (FC -> MQTT)</span><span class='v' id='c2_tx_stat'></span></div>"
+           "<div class='row'><span>Uplink (MQTT -> FC)</span><span class='v' id='c2_rx_stat'></span></div>"
+           "<div class='row'><span>Drop / Lỗi CRC</span><span class='v' id='c2_err_stat'></span></div>"
+           "<div class='row'><span>Chu kỳ gom gói</span><span class='v' id='c2_bms'></span></div>"
+           "</div></div></div>");
+
     // Thẻ chỉnh nhanh tạm thời trên RAM: không lưu NVS, không cần reboot, tắt bật lại sẽ về mặc định.
     const uint32_t cur_mqtt_hz = (cfg.publish_interval_ms > 0U)
         ? ((1000U + (cfg.publish_interval_ms / 2U)) / cfg.publish_interval_ms)
@@ -277,6 +292,15 @@ static String tdmDashboardHtml()
     h += htmlEscape(cfg.version);
     h += F("'></div><div><label>Bandwidth text</label><input name='bandwidth' maxlength='16' value='");
     h += htmlEscape(cfg.bandwidth);
+    h += F("'></div></div><h3>C2 Link (MAVLink-over-MQTT)</h3><div class='two'><div><label>C2 Bridge</label><select name='c2_enable'>");
+    h += String("<option value='1'") + (cfg.c2_enable ? " selected" : "") + ">Bật (Enabled)</option>";
+    h += String("<option value='0'") + (!cfg.c2_enable ? " selected" : "") + ">Tắt (Disabled)</option>";
+    h += F("</select></div><div><label>C2 Batch interval (ms, 20-500)</label><input name='c2_batch_ms' type='number' min='20' max='500' value='");
+    h += String(cfg.c2_batch_ms);
+    h += F("'></div></div><div class='two'><div><label>C2 TX Topic (FC -> GCS)</label><input name='c2_tx_topic' maxlength='96' value='");
+    h += htmlEscape(cfg.c2_tx_topic);
+    h += F("'></div><div><label>C2 RX Topic (GCS -> FC)</label><input name='c2_rx_topic' maxlength='96' value='");
+    h += htmlEscape(cfg.c2_rx_topic);
     h += F("'></div></div><button type='submit'>SAVE & REBOOT</button>"
            "<p class='note'>Passwords are stored in ESP32 NVS and are never returned by the JSON API. Saving restarts the board so Wi-Fi and LTE/MQTT settings are applied cleanly.</p></form></div>");
 
@@ -300,6 +324,14 @@ static String tdmDashboardHtml()
            "set('fc_loc_src',fc.locationSource||'-');"
            "set('fc_rx_frames',fc.rxFrames!==undefined?fc.rxFrames:'-');"
            "set('fc_rx_bytes',fc.rxBytes!==undefined?(fc.rxBytes+' B'):'-');"
+           "let c2=j.c2||{};"
+           "set('c2_en',c2.enabled?'<span class=ok>BẬT</span>':'<span class=bad>TẮT</span>');"
+           "set('c2_sub',c2.subscribed?'<span class=ok>ĐÃ SUBSCRIBE</span>':'<span class=bad>CHƯA</span>');"
+           "set('c2_tx_t',t.c2TxTopic);set('c2_rx_t',t.c2RxTopic);"
+           "set('c2_tx_stat',c2.txFrames!==undefined?(c2.txFrames+' f / '+c2.txBytes+' B'):'-');"
+           "set('c2_rx_stat',c2.rxFrames!==undefined?(c2.rxFrames+' f / '+c2.rxBytes+' B'):'-');"
+           "set('c2_err_stat',c2.txDropped!==undefined?('TXdrop='+c2.txDropped+' RXdrop='+c2.rxDropped+' CRC='+c2.rxInvalid):'-');"
+           "set('c2_bms',t.c2BatchMs?(t.c2BatchMs+' ms'):'-');"
            "}catch(e){set('err','dashboard poll failed');}}"
            "async function applyFcBaudrate(){let baud=document.getElementById('fc_baud_sel').value;set('fc_msg','Đang đổi baudrate UART1 sang '+baud+' bps...');"
            "try{let r=await fetch('/api/fc/baudrate?baud='+encodeURIComponent(baud),{method:'POST'});let j=await r.json();"
@@ -341,6 +373,7 @@ static void setupTDM2421Routes()
         s += "\"tdm\":" + tdm2421_mqtt.statusJson() + ",";
         s += "\"rid\":" + status_json() + ",";
         s += "\"fc\":" + mavlink_fc_status_json() + ",";
+        s += "\"c2\":" + tdm2421_c2.statusJson(tdm2421_mqtt.isC2Subscribed()) + ",";
         s += "\"ap\":{";
         s += "\"ssid\":\"" + jsonEscape(g.wifi_ssid) + "\",";
         s += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
@@ -446,7 +479,11 @@ static void setupTDM2421Routes()
         argToBuf("uav_serial", cfg.uav_serial, sizeof(cfg.uav_serial), true);
         argToBuf("version", cfg.version, sizeof(cfg.version), false);
         argToBuf("bandwidth", cfg.bandwidth, sizeof(cfg.bandwidth), false);
+        argToBuf("c2_tx_topic", cfg.c2_tx_topic, sizeof(cfg.c2_tx_topic), false);
+        argToBuf("c2_rx_topic", cfg.c2_rx_topic, sizeof(cfg.c2_rx_topic), false);
 
+        if (server.hasArg("c2_enable")) cfg.c2_enable = (server.arg("c2_enable").toInt() != 0);
+        if (server.hasArg("c2_batch_ms")) cfg.c2_batch_ms = (uint16_t)server.arg("c2_batch_ms").toInt();
         if (server.hasArg("port")) cfg.mqtt_port = (uint16_t)server.arg("port").toInt();
         if (server.hasArg("pub_ms")) cfg.publish_interval_ms = (uint32_t)server.arg("pub_ms").toInt();
         if (server.hasArg("recon_ms")) cfg.reconnect_interval_ms = (uint32_t)server.arg("recon_ms").toInt();
