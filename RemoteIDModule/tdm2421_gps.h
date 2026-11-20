@@ -62,9 +62,10 @@ private:
     size_t line_len_ = 0;
 
     // Mốc thời gian phát hiện kết nối vật lý và đo tần số thực tế.
+    static constexpr uint8_t DEFAULT_HZ = 5;
     uint32_t last_rx_ms_ = 0;
     uint32_t last_nmea_ms_ = 0;
-    uint8_t configured_hz_ = 10;
+    uint8_t configured_hz_ = DEFAULT_HZ;
     uint32_t rate_win_start_ms_ = 0;
     uint16_t rate_win_count_ = 0;
     uint8_t measured_hz_ = 0;

@@ -13,6 +13,7 @@
 #if defined(BOARD_TDM2421)
 #include "tdm2421_mqtt.h"
 #include "tdm2421_gps.h"
+#include "tdm2421_debug.h"
 #endif
 
 static WebServer server(80);
@@ -119,7 +120,7 @@ static String tdmDashboardHtml()
     tdm2421_mqtt.getConfig(cfg);
 
     String h;
-    h.reserve(18000);
+    h.reserve(22000);
     h += F("<!doctype html><html><head><meta charset='utf-8'>");
     h += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
     h += F("<title>TDM2421 Control</title><style>");
@@ -173,6 +174,7 @@ static String tdmDashboardHtml()
            "<div class='row'><span>Connected</span><span class='v' id='mqtt'></span></div>"
            "<div class='row'><span>Broker</span><span class='v' id='broker'></span></div>"
            "<div class='row'><span>Topic</span><span class='v' id='topic'></span></div>"
+           "<div class='row'><span>Publish rate</span><span class='v' id='mqtt_rate'></span></div>"
            "<div class='row'><span>Published</span><span class='v' id='msgcnt'></span></div>"
            "<div class='row'><span>Last publish age</span><span class='v' id='pubage'></span></div>"
            "<div class='row'><span>Last error</span><span class='v' id='err'></span></div></div>");
@@ -228,6 +230,27 @@ static String tdmDashboardHtml()
            "<pre class='gpsbox' id='test_samples'></pre></div></div>");
 #endif
 
+    // Thẻ chỉnh nhanh tạm thời trên RAM: không lưu NVS, không cần reboot, tắt bật lại sẽ về mặc định.
+    const uint32_t cur_mqtt_hz = (cfg.publish_interval_ms > 0U)
+        ? ((1000U + (cfg.publish_interval_ms / 2U)) / cfg.publish_interval_ms)
+        : 10U;
+    h += F("<div class='card'><h3>Cấu hình tạm thời (Chạy ngay - Tự reset khi khởi động lại)</h3>"
+           "<div class='two'>"
+           "<div class='row'><span>Remote ID đang phát</span><span class='v' id='temp_cur_id'></span></div>"
+           "<div class='row'><span>Tần số MQTT đang chạy</span><span class='v' id='temp_cur_rate'></span></div>"
+           "</div>"
+           "<div class='two' style='margin-top:8px'><div>"
+           "<label>Remote ID mới (Basic ID, tối đa 20 ký tự)</label>"
+           "<input id='temp_basic_id' maxlength='20' value='");
+    h += htmlEscape(g.uas_id);
+    h += F("'></div><div>"
+           "<label>Tần số publish MQTT mới (1 - 30 Hz)</label>"
+           "<input id='temp_mqtt_hz' type='number' min='1' max='30' step='1' value='");
+    h += String(cur_mqtt_hz);
+    h += F("'></div></div>"
+           "<button type='button' onclick='applyTempConfig()'>Áp dụng ngay (Không reboot)</button>"
+           "<p class='note' id='temp_cfg_msg'>Chỉ lưu tạm trên RAM: áp dụng ngay lập tức cho Wi-Fi/BLE/MQTT mà không mất kết nối; lần khởi động sau tự quay về mặc định.</p></div>");
+
     h += F("<div class='card'><h2>Configuration</h2><form method='POST' action='/save'>");
     h += F("<h3>Wi-Fi AP</h3><div class='two'><div><label>SSID</label><input name='ap_ssid' maxlength='20' value='");
     h += htmlEscape(g.wifi_ssid);
@@ -274,8 +297,10 @@ static String tdmDashboardHtml()
            "async function poll(){try{let r=await fetch('/api/status',{cache:'no-store'});let j=await r.json();let t=j.tdm||{},q=j.rid||{},a=j.ap||{};"
            "set('ap_ssid',a.ssid);set('ap_ip',a.ip);set('ap_clients',a.clients);set('ap_channel',a.channel);"
            "set('sim',yn(t.simReady));set('lte_reg',yn(t.lteRegistered));set('pdp',yn(t.pdpActive));set('lte_ip',t.lteIp);set('rssi',t.rssiDbm? t.rssiDbm+' dBm':'-');set('gnss_engine',yn(t.gnssEngineRunning));set('gnss',yn(t.gnssValid));set('gnss_fix',t.gnssFixText);set('gnss_sat',t.gnssSatellites);set('gnss_used',t.gnssDopValid?t.gnssSatellitesUsed:'N/A');set('gnss_hdop',t.gnssHdop);set('gnss_vdop',t.gnssDopValid?t.gnssVdop:'N/A');set('gnss_pdop',t.gnssDopValid?t.gnssPdop:'N/A');set('gnss_utc',t.gnssUtc);set('gnss_date',t.gnssDate);set('gnss_age',t.gnssAgeMs+' ms');set('gnss_lat',t.gnssLat);set('gnss_lon',t.gnssLon);set('gnss_alt',t.gnssAlt+' m');set('gnss_speed',t.gnssSpeed+' m/s');set('gnss_course',t.gnssCourseValid?t.gnssCourse+' deg':'N/A');"
-           "set('mqtt',yn(t.mqttConnected));set('broker',t.broker);set('topic',t.topic);set('msgcnt',t.msgCnt);set('pubage',t.lastPublishAgeMs? t.lastPublishAgeMs+' ms':'-');set('err',t.lastError);"
+           "let rateTxt=t.publishIntervalMs?(Math.round(1000/t.publishIntervalMs)+' Hz ('+t.publishIntervalMs+' ms)'):'-';"
+           "set('mqtt',yn(t.mqttConnected));set('broker',t.broker);set('topic',t.topic);set('mqtt_rate',rateTxt);set('msgcnt',t.msgCnt);set('pubage',t.lastPublishAgeMs? t.lastPublishAgeMs+' ms':'-');set('err',t.lastError);"
            "set('source',q['STATUS:DATA_SOURCE']);set('mav',q['MAVLINK:Connected']);let bid=q['BASICID:UASID']||'';set('basic_id',bid||'N/A');set('basic_type',q['BASICID:IDType']||'N/A');set('basic_source',bid?'OpenDroneID Basic ID':'Device ID fallback');set('device_id',t.deviceId);set('uav_serial',t.uavSerial||bid||t.deviceId);set('object_id',bid||t.deviceId);set('lat',q['LOCATION:Latitude']);set('lon',q['LOCATION:Longitude']);set('alt',q['LOCATION:AltitudeGeo']+' m');set('speed',q['LOCATION:SpeedHorizontal']+' m/s');set('hdg',q['LOCATION:Direction']+' deg');"
+           "set('temp_cur_id',bid||'N/A');set('temp_cur_rate',rateTxt);"
 #if TDM2421_USE_EXT_GPS
            "let g=j.extgps||{};"
            "set('extgps_conn',g.connected?'<span class=ok>ĐÃ CẮM</span>':'<span class=bad>CHƯA CẮM</span>');"
@@ -302,6 +327,15 @@ static String tdmDashboardHtml()
            "document.getElementById('test_samples').textContent=d.samples||'(Không nhận được câu NMEA nào trong 1 giây — kiểm tra dây TX/RX GPIO 4/5 hoặc nguồn GPS)';"
            "set('extgps_msg','Test hoàn tất.');}catch(e){set('extgps_msg','Lỗi khi test module GPS.');}finally{btn.disabled=false;btn.textContent='Test module (1s)';}}"
 #endif
+           "async function applyTempConfig(){"
+           "let bid=document.getElementById('temp_basic_id').value.trim();"
+           "let hz=document.getElementById('temp_mqtt_hz').value.trim();"
+           "set('temp_cfg_msg','Đang áp dụng cấu hình tạm thời...');"
+           "try{let body=new URLSearchParams({basic_id:bid,mqtt_hz:hz});"
+           "let r=await fetch('/api/temp_config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body.toString()});"
+           "let j=await r.json();"
+           "set('temp_cfg_msg',j.ok?('Đã áp dụng ngay (không reboot): ID='+j.basicId+', MQTT='+j.mqttHz+' Hz ('+j.publishIntervalMs+' ms). Tự reset về mặc định khi khởi động lại.'):('Lỗi: '+(j.error||'Thông số không hợp lệ')));"
+           "poll();}catch(e){set('temp_cfg_msg','Không gửi được yêu cầu áp dụng tạm thời.');}}"
            "poll();setInterval(poll,1000);</script></body></html>");
     return h;
 }
@@ -364,6 +398,51 @@ static void setupTDM2421Routes()
         server.send(200, "application/json", tdm2421_gps.testStatusJson());
     });
 #endif
+    // API chỉnh nhanh Remote ID và tần số publish MQTT tạm thời trên RAM:
+    // áp dụng ngay không cần reboot/reconnect, không ghi NVS nên lần boot sau tự về mặc định.
+    server.on("/api/temp_config", HTTP_POST, []() {
+        String bid = server.hasArg("basic_id") ? server.arg("basic_id") : String();
+        bid.trim();
+        const int hz = server.hasArg("mqtt_hz") ? server.arg("mqtt_hz").toInt() : 0;
+
+        server.sendHeader("Cache-Control", "no-store");
+        if (bid.length() == 0 || bid.length() > 20) {
+            server.send(400, "application/json", "{\"ok\":false,\"error\":\"Remote ID phai tu 1 den 20 ky tu\"}");
+            return;
+        }
+        if (hz < 1 || hz > 30) {
+            server.send(400, "application/json", "{\"ok\":false,\"error\":\"Tan so MQTT phai tu 1 den 30 Hz\"}");
+            return;
+        }
+
+        const uint32_t interval_ms = (1000U + ((uint32_t)hz / 2U)) / (uint32_t)hz;
+        if (!tdm2421_mqtt.setRuntimePublishIntervalMs(interval_ms)) {
+            server.send(500, "application/json", "{\"ok\":false,\"error\":\"Khong cap nhat duoc tan so MQTT\"}");
+            return;
+        }
+
+        // Chỉ cập nhật vào RAM của biến toàn cục g, tuyệt đối không gọi set_by_name_* để tránh ghi NVS.
+        memset(g.uas_id, 0, sizeof(g.uas_id));
+        strncpy(g.uas_id, bid.c_str(), sizeof(g.uas_id) - 1);
+        if (g.ua_type == 0) {
+            g.ua_type = ODID_UATYPE_HELICOPTER_OR_MULTIROTOR;
+        }
+        if (g.id_type == 0) {
+            g.id_type = ODID_IDTYPE_SERIAL_NUMBER;
+        }
+
+        tdmDebugPrintf(1, "[TEMP CFG] basicId='%s' mqttHz=%d interval=%lu ms (RAM only)\r\n",
+                       g.uas_id, hz, (unsigned long)interval_ms);
+
+        String resp = "{\"ok\":true,\"basicId\":\"";
+        resp += jsonEscape(g.uas_id);
+        resp += "\",\"mqttHz\":";
+        resp += String(hz);
+        resp += ",\"publishIntervalMs\":";
+        resp += String(interval_ms);
+        resp += "}";
+        server.send(200, "application/json", resp);
+    });
     server.on("/save", HTTP_POST, []() {
         TDM2421Config cfg {};
         tdm2421_mqtt.getConfig(cfg);

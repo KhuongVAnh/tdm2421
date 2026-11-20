@@ -51,6 +51,8 @@ public:
     // Runtime configuration stored in ESP32 NVS namespace "tdmnet".
     void getConfig(TDM2421Config &out);
     bool saveConfig(const TDM2421Config &cfg);
+    // Cập nhật chu kỳ publish MQTT tạm thời trong RAM (không lưu NVS, không reconnect/reboot).
+    bool setRuntimePublishIntervalMs(uint32_t interval_ms);
 
     // Đọc tọa độ GNSS mới nhất (từ EG800K hoặc do GPS ngoài cập nhật). An toàn đa luồng.
     bool getGNSSFix(TDM2421GNSSFix &out, uint32_t max_age_ms = 5000);

@@ -101,10 +101,10 @@ void TDM2421ExtGPS::applyUbxRateConfig(uint8_t hz)
 
 void TDM2421ExtGPS::begin()
 {
-    // Đọc tần số đã lưu trong NVS (mặc định 10 Hz nếu chưa từng cấu hình).
+    // Đọc tần số đã lưu trong NVS (mặc định 5 Hz nếu chưa từng cấu hình).
     Preferences prefs;
     if (prefs.begin(GPS_NVS_NAMESPACE, true)) {
-        const uint8_t saved_hz = prefs.getUChar("hz", 10);
+        const uint8_t saved_hz = prefs.getUChar("hz", DEFAULT_HZ);
         prefs.end();
         if (isValidHz(saved_hz)) {
             configured_hz_ = saved_hz;

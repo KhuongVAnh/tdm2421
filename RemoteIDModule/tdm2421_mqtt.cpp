@@ -211,6 +211,21 @@ bool TDM2421MQTT::saveConfig(const TDM2421Config &cfg)
     return true;
 }
 
+bool TDM2421MQTT::setRuntimePublishIntervalMs(uint32_t interval_ms)
+{
+    // Chỉ cập nhật chu kỳ publish trong RAM để áp dụng tức thì mà không ghi NVS
+    // và không ngắt kết nối LTE/MQTT; lần khởi động tiếp theo sẽ tự quay về mặc định.
+    if (interval_ms < MIN_PUBLISH_INTERVAL_MS || interval_ms > 60000U) {
+        return false;
+    }
+    if (config_mutex && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        config.publish_interval_ms = interval_ms;
+        xSemaphoreGive(config_mutex);
+        return true;
+    }
+    return false;
+}
+
 void TDM2421MQTT::submit(const ODID_UAS_Data &uas, uint8_t wifi_channel)
 {
     // UAS_data is the single source of truth shared by Broadcast RID and MQTT.
@@ -1229,6 +1244,7 @@ String TDM2421MQTT::statusJson()
     s += "\"rssiDbm\":" + String(local_rssi) + ",";
     s += "\"signalQuality\":" + String(local_csq) + ",";
     s += "\"msgCnt\":" + String(msg_count) + ",";
+    s += "\"publishIntervalMs\":" + String(cfg.publish_interval_ms) + ",";
     s += "\"lastPublishAgeMs\":" + String(local_last_pub == 0 ? 0 : (millis() - local_last_pub)) + ",";
     s += "\"lastError\":\"" + jsonEscape(local_err) + "\",";
     s += "\"broker\":\"" + jsonEscape(String(cfg.mqtt_host) + ":" + String(cfg.mqtt_port)) + "\",";
