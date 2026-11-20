@@ -4,8 +4,10 @@
 
 #include "board_config.h"
 #include "tdm2421_c2.h"
+#include "tdm2421_gnss.h"
 #include "tdm2421_debug.h"
 #include "mavlink.h"
+#include "parameters.h"
 #include <Preferences.h>
 #include <inttypes.h>
 
@@ -24,8 +26,8 @@ static const char *DEFAULT_DEVICE_ID    = "TDM2421";
 static const char *DEFAULT_VERSION      = "V1.0";
 static const char *DEFAULT_BANDWIDTH    = "20MHz";
 static const bool DEFAULT_C2_ENABLE     = true;
-static const char *DEFAULT_C2_TX_TOPIC  = "p3000m/c2/tx";
-static const char *DEFAULT_C2_RX_TOPIC  = "p3000m/c2/rx";
+static const char *DEFAULT_C2_TX_TOPIC  = "p3000m/c2/1866ASDD0000VT5/tx";
+static const char *DEFAULT_C2_RX_TOPIC  = "p3000m/c2/1866ASDD0000VT5/rx";
 #if defined(TDM2421_C2_MAX_HZ) && TDM2421_C2_MAX_HZ > 0
 static const uint16_t BUILD_C2_BATCH_MS =
     (uint16_t)((1000U + (TDM2421_C2_MAX_HZ / 2U)) / TDM2421_C2_MAX_HZ);
@@ -86,7 +88,6 @@ void TDM2421MQTT::begin()
     snapshot_mutex = xSemaphoreCreateMutex();
     config_mutex = xSemaphoreCreateMutex();
     state_mutex = xSemaphoreCreateMutex();
-    gnss_mutex = xSemaphoreCreateMutex();
 
     loadConfig();
     xTaskCreate(taskEntry, "tdm_mqtt", 8192, this, 1, nullptr);
@@ -109,8 +110,9 @@ void TDM2421MQTT::loadConfig()
     cfg.publish_interval_ms = DEFAULT_PUBLISH_INTERVAL_MS;
     cfg.reconnect_interval_ms = DEFAULT_RECONNECT_INTERVAL_MS;
     cfg.c2_enable = DEFAULT_C2_ENABLE;
-    copyCString(cfg.c2_tx_topic, DEFAULT_C2_TX_TOPIC);
-    copyCString(cfg.c2_rx_topic, DEFAULT_C2_RX_TOPIC);
+    const char *init_rid = (g.uas_id[0] != '\0') ? g.uas_id : DEFAULT_DEVICE_ID;
+    snprintf(cfg.c2_tx_topic, sizeof(cfg.c2_tx_topic), "p3000m/c2/%s/tx", init_rid);
+    snprintf(cfg.c2_rx_topic, sizeof(cfg.c2_rx_topic), "p3000m/c2/%s/rx", init_rid);
     cfg.c2_batch_ms = DEFAULT_C2_BATCH_MS;
 
     Preferences prefs;
@@ -132,6 +134,16 @@ void TDM2421MQTT::loadConfig()
         copyString(cfg.c2_tx_topic, prefs.getString("c2_tx", cfg.c2_tx_topic));
         copyString(cfg.c2_rx_topic, prefs.getString("c2_rx", cfg.c2_rx_topic));
         cfg.c2_batch_ms = prefs.getUShort("c2_bms", cfg.c2_batch_ms);
+
+        // Chuyển đổi topic C2 cũ ("p3000m/c2/tx", "p3000m/c2/rx") sang định dạng phân biệt theo Remote ID.
+        const char *rid = (g.uas_id[0] != '\0') ? g.uas_id :
+                          (cfg.device_id[0] != '\0' ? cfg.device_id : DEFAULT_DEVICE_ID);
+        if (cfg.c2_tx_topic[0] == '\0' || strcmp(cfg.c2_tx_topic, "p3000m/c2/tx") == 0) {
+            snprintf(cfg.c2_tx_topic, sizeof(cfg.c2_tx_topic), "p3000m/c2/%s/tx", rid);
+        }
+        if (cfg.c2_rx_topic[0] == '\0' || strcmp(cfg.c2_rx_topic, "p3000m/c2/rx") == 0) {
+            snprintf(cfg.c2_rx_topic, sizeof(cfg.c2_rx_topic), "p3000m/c2/%s/rx", rid);
+        }
 
         // Store defaults/current values so the namespace is fully initialised.
         prefs.putString("apn", cfg.apn);
@@ -466,22 +478,27 @@ void TDM2421MQTT::setMQTTState(bool value)
 bool TDM2421MQTT::getGNSSFix(TDM2421GNSSFix &out, uint32_t max_age_ms)
 {
     memset(&out, 0, sizeof(out));
-    if (gnss_mutex == nullptr ||
-        xSemaphoreTake(gnss_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+    TDM2421GnssRecord rec {};
+    if (!tdm2421_gnss.getEg800k(rec, max_age_ms, millis())) {
         return false;
     }
-    out = gnss_fix;
-    const uint32_t fix_ms = gnss_last_fix_ms;
-    xSemaphoreGive(gnss_mutex);
-
-    if (!out.valid || fix_ms == 0) {
-        return false;
-    }
-    out.age_ms = millis() - fix_ms;
-    if (out.age_ms > max_age_ms) {
-        out.valid = false;
-        return false;
-    }
+    out.valid = rec.valid;
+    out.latitude = rec.latitude;
+    out.longitude = rec.longitude;
+    out.altitude_m = rec.altitude_msl_m;
+    out.speed_mps = rec.speed_mps;
+    out.course_deg = rec.course_deg;
+    out.hdop = rec.hdop;
+    out.pdop = rec.pdop;
+    out.vdop = rec.vdop;
+    out.fix_type = rec.fix_type;
+    out.satellites = rec.satellites;
+    out.satellites_used = rec.satellites_used;
+    out.course_valid = rec.course_valid;
+    out.dop_valid = rec.dop_valid;
+    snprintf(out.utc, sizeof(out.utc), "%s", rec.utc);
+    snprintf(out.date, sizeof(out.date), "%s", rec.date);
+    out.age_ms = rec.age_ms;
     return true;
 }
 
@@ -630,16 +647,15 @@ void TDM2421MQTT::refreshGNSSDOP()
 {
     // EG800K supports acquisition of NMEA sentences through QGPSGNMEA. GSA carries PDOP/HDOP/VDOP.
     String r = sendAT("AT+QGPSGNMEA=\"GSA\"", 1000);
-    float p=0,h=0,v=0; uint8_t used=0;
-    if (!parseGSA(r,p,h,v,used)) return;
-    if (gnss_mutex && xSemaphoreTake(gnss_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        gnss_fix.pdop=p; gnss_fix.hdop=h; gnss_fix.vdop=v; gnss_fix.satellites_used=used; gnss_fix.dop_valid=true;
-        gnss_last_dop_ms=millis();
-        xSemaphoreGive(gnss_mutex);
-    }
+    float p = 0, h = 0, v = 0;
+    uint8_t used = 0;
+    if (!parseGSA(r, p, h, v, used)) return;
+    const uint32_t now_ms = millis();
+    gnss_last_dop_ms = now_ms;
+    tdm2421_gnss.updateEg800kDop(p, h, v, used, now_ms);
 }
 
-void TDM2421MQTT::refreshGNSS()
+void TDM2421MQTT::refreshGNSS(bool skip_dop)
 {
     if (!gnss_started && !ensureGNSS()) return;
 
@@ -661,25 +677,39 @@ void TDM2421MQTT::refreshGNSS()
                 tdmDebugPrintln(1, "[GNSS] QGPSLOC response has no valid fix");
             }
         }
-        // Keep the previous fix only until getGNSSFix() ages it out.
         return;
     }
 
-    if (gnss_mutex && xSemaphoreTake(gnss_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        // Preserve the latest GSA-derived diagnostics while refreshing QGPSLOC fields.
-        if (gnss_fix.dop_valid && (millis() - gnss_last_dop_ms) < 15000) {
-            fix.pdop = gnss_fix.pdop; fix.hdop = gnss_fix.hdop; fix.vdop = gnss_fix.vdop;
-            fix.satellites_used = gnss_fix.satellites_used; fix.dop_valid = true;
-        }
-        gnss_fix = fix;
-        gnss_last_fix_ms = millis();
-        xSemaphoreGive(gnss_mutex);
+    const uint32_t now_ms = millis();
+    TDM2421GnssRecord rec {};
+    rec.valid = true;
+    rec.latitude = fix.latitude;
+    rec.longitude = fix.longitude;
+    rec.altitude_msl_m = fix.altitude_m;
+    rec.height_agl_m = fix.altitude_m;
+    rec.height_valid = true;
+    rec.speed_mps = fix.speed_mps;
+    rec.speed_vertical_mps = 0.0f;
+    rec.course_deg = fix.course_deg;
+    rec.course_valid = fix.course_valid;
+    rec.hdop = fix.hdop;
+    rec.fix_type = fix.fix_type;
+    rec.satellites = fix.satellites;
+    rec.odid_status = ODID_STATUS_AIRBORNE;
+    rec.odid_timestamp_s = 0.0f;
+    snprintf(rec.utc, sizeof(rec.utc), "%s", fix.utc);
+    snprintf(rec.date, sizeof(rec.date), "%s", fix.date);
+    snprintf(rec.sub_source, sizeof(rec.sub_source), "EG800K");
+    rec.updated_ms = now_ms;
+    tdm2421_gnss.updateEg800k(rec);
+
+    if (!skip_dop && (uint32_t)(now_ms - gnss_last_dop_ms) >= 10000U) {
+        refreshGNSSDOP();
     }
-    if (millis() - gnss_last_dop_ms >= 5000) refreshGNSSDOP();
 
     static uint32_t last_print = 0;
-    if (millis() - last_print >= 5000) {
-        last_print = millis();
+    if (now_ms - last_print >= 5000) {
+        last_print = now_ms;
         tdmDebugPrintf(2, "[GNSS] fix=%u sats=%u lat=%.7f lon=%.7f alt=%.1f speed=%.2f course=%.1f hdop=%.1f\r\n",
                       fix.fix_type, fix.satellites, fix.latitude, fix.longitude,
                       fix.altitude_m, fix.speed_mps, fix.course_deg, fix.hdop);
@@ -1410,7 +1440,7 @@ String TDM2421MQTT::statusJson()
     s += "\"deviceId\":\"" + jsonEscape(cfg.device_id) + "\",";
     s += "\"uavSerial\":\"" + jsonEscape(cfg.uav_serial) + "\",";
     TDM2421GNSSFix gf {};
-    const bool gv = getGNSSFix(gf, 10000);
+    const bool gv = getGNSSFix(gf, 15000);
     s += "\"gnssValid\":" + String(gv ? "true" : "false") + ",";
     s += "\"gnssLat\":" + String(gf.latitude, 7) + ",";
     s += "\"gnssLon\":" + String(gf.longitude, 7) + ",";
@@ -1465,10 +1495,10 @@ void TDM2421MQTT::task()
         }
 
         if (!network_ok || !mqtt_ok) {
-            // No active MQTT stream: GNSS may continue at 1 Hz while reconnecting.
-            if (modem_seen && now - last_gnss >= 1000UL) {
+            // Khi chưa nối xong MQTT, vẫn giữ EG800K GNSS cập nhật đều để sẵn sàng dự phòng.
+            if (modem_seen && now - last_gnss >= 1500UL) {
                 last_gnss = now;
-                refreshGNSS();
+                refreshGNSS(false);
             }
             if (now - last_reconnect >= cfg.reconnect_interval_ms) {
                 last_reconnect = now;
@@ -1589,14 +1619,14 @@ void TDM2421MQTT::task()
             }
         }
 
-#if TDM2421_ENABLE_RID
-        // Housekeeping tần suất thấp: chỉ poll EG800K GNSS khi FC không cung cấp tọa độ MAVLink tươi
-        // để nhường toàn bộ băng thông UART0 cho đường truyền C2.
-        if (modem_seen && !mav_location_fresh_flag && now - last_gnss >= GNSS_REFRESH_INTERVAL_MS) {
+        // Warm-lock thông minh cho EG800K GNSS:
+        //   - Khi FC đang có GPS tươi: poll thưa mỗi 10s (bỏ GSA) để giữ warm-lock mà không làm khựng C2 30 Hz.
+        //   - Khi FC mất GPS: chuyển sang poll 1.5s/lần để chuyển dự phòng tức thì cho Remote ID.
+        const uint32_t gnss_period_ms = mav_location_fresh_flag ? 10000UL : 1500UL;
+        if (modem_seen && (uint32_t)(now - last_gnss) >= gnss_period_ms) {
             last_gnss = now;
-            refreshGNSS();
+            refreshGNSS(mav_location_fresh_flag);
         }
-#endif
 
         if (now - last_signal >= SIGNAL_REFRESH_INTERVAL_MS) {
             last_signal = now;

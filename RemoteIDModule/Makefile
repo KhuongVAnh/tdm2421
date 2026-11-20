@@ -63,15 +63,15 @@ CUAV-RID: ArduRemoteID-CUAV_RID.bin
 #   make tdm2421 MQTT_HZ=1    # 1 Hz  (1000 ms)
 #   make tdm2421 MQTT_HZ=0    # use NVS/Web dashboard pub_ms instead
 # Valid fixed-rate range is 1..30 Hz.
-MQTT_HZ ?= 10
+MQTT_HZ ?= 5
 
 # C2_HZ controls the fixed C2 downlink flush rate at build time (0 = use Web/NVS c2_batch_ms):
 #   make tdm2421 C2_HZ=30 RID_ENABLE=0
-C2_HZ ?= 30
+C2_HZ ?= 20
 # RID_ENABLE controls whether Remote ID (Wi-Fi/BLE/MQTT JSON) runs alongside C2:
 #   0 = disable Remote ID temporarily to prioritize C2 bandwidth/CPU
 #   1 = enable Remote ID alongside C2
-RID_ENABLE ?= 0
+RID_ENABLE ?= 1
 
 # Mức log USB CDC cho TDM2421 (không chặn khi rút cáp USB):
 #   0 = production: tắt log định kỳ

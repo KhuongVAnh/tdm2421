@@ -26,6 +26,7 @@
 #include "led.h"
 #include "tdm2421_mqtt.h"
 #include "tdm2421_c2.h"
+#include "tdm2421_gnss.h"
 #include "tdm2421_debug.h"
 
 
@@ -218,7 +219,8 @@ void setup()
                   (unsigned)SIM_UART_BAUD,
                   (int)PIN_SIM_UART_RX, (int)PIN_SIM_UART_TX);
 
-    // Khởi tạo cầu nối C2 trước khi task LTE/MQTT bắt đầu chạy.
+    // Khởi tạo vùng nhớ chung 2 nguồn GPS và cầu nối C2 trước khi task LTE/MQTT bắt đầu chạy.
+    tdm2421_gnss.begin();
     tdm2421_c2.begin();
 
     // Start LTE/MQTT worker task. It runs independently from the
@@ -491,20 +493,20 @@ static void set_data(Transport &t)
 }
 
 #if defined(BOARD_TDM2421)
-// Hàm dùng chung để nạp bản ghi GNSS (từ GPS ngoài hoặc EG800K) vào UAS_data.Location.
-static void apply_gnss_fix_to_location(const TDM2421GNSSFix &fix, float timestamp_s)
+// Hàm dùng chung để nạp bản ghi GNSS từ vùng nhớ chung (FC_MAVLINK hoặc EG800K_GNSS) vào UAS_data.Location.
+static void apply_gnss_record_to_location(const TDM2421GnssRecord &rec)
 {
-    UAS_data.Location.Status = ODID_STATUS_AIRBORNE;
-    UAS_data.Location.Direction = fix.course_deg;
-    UAS_data.Location.SpeedHorizontal = fix.speed_mps;
-    UAS_data.Location.SpeedVertical = 0.0f;
-    UAS_data.Location.Latitude = fix.latitude;
-    UAS_data.Location.Longitude = fix.longitude;
-    UAS_data.Location.AltitudeGeo = fix.altitude_m;
-    UAS_data.Location.AltitudeBaro = fix.altitude_m;
+    UAS_data.Location.Status = (ODID_status_t)rec.odid_status;
+    UAS_data.Location.Direction = rec.course_valid ? rec.course_deg : 361.0f;
+    UAS_data.Location.SpeedHorizontal = rec.speed_mps;
+    UAS_data.Location.SpeedVertical = rec.speed_vertical_mps;
+    UAS_data.Location.Latitude = rec.latitude;
+    UAS_data.Location.Longitude = rec.longitude;
+    UAS_data.Location.AltitudeGeo = rec.altitude_msl_m;
+    UAS_data.Location.AltitudeBaro = rec.altitude_msl_m;
     UAS_data.Location.HeightType = ODID_HEIGHT_REF_OVER_TAKEOFF;
-    UAS_data.Location.Height = fix.altitude_m;
-    UAS_data.Location.TimeStamp = timestamp_s;
+    UAS_data.Location.Height = rec.height_valid ? rec.height_agl_m : rec.altitude_msl_m;
+    UAS_data.Location.TimeStamp = rec.odid_timestamp_s;
     UAS_data.LocationValid = 1;
 }
 #endif
@@ -677,15 +679,11 @@ void loop()
         UAS_data.SystemValid = 1;
     }
 
-    TDM2421GNSSFix eg_fix {};
-    const bool eg_gnss_fresh = tdm2421_mqtt.getGNSSFix(eg_fix, 5000);
-    bool selected_location_valid = false;
-    uint32_t selected_location_age_ms = status_mavlink_age_ms;
+    TDM2421GnssRecord active_rec {};
+    const uint32_t fc_hold_ms = MAV_LOCATION_HOLD_MS;
+    const uint32_t eg_hold_ms = 15000;
 
-    // Last-good MAVLink location latch.  set_data() clears UAS_data every
-    // iteration, so retain a complete decoded ODID location independently.
-    // EG800K is not allowed to replace this snapshot until the MAVLink
-    // transport location itself has genuinely exceeded MAV_LOCATION_HOLD_MS.
+    // Giữ lại cấu trúc ODID_Location_data nguyên bản nếu FC gửi OPEN_DRONE_ID_LOCATION.
     static ODID_Location_data last_good_mav_location {};
     static bool have_last_good_mav_location = false;
     static uint32_t last_latched_transport_location_ms = 0;
@@ -698,38 +696,49 @@ void loop()
         last_latched_transport_location_ms = transport_last_location_ms;
     }
 
-    if (mav_location_fresh && have_last_good_mav_location) {
-        // Priority 1: latched Autopilot/MAVLink location.
-        UAS_data.Location = last_good_mav_location;
+    // Chọn nguồn tọa độ từ vùng nhớ chung:
+    //   Ưu tiên 1: Gói tọa độ parse từ FC (FC_MAVLINK)
+    //   Ưu tiên 2: Module GNSS gắn liền EG800K (EG800K_GNSS)
+    const TDM2421GnssSource active_src = tdm2421_gnss.selectActive(
+        active_rec, now_ms, fc_hold_ms, eg_hold_ms);
+
+    bool selected_location_valid = false;
+    uint32_t selected_location_age_ms = 0;
+
+    if (active_src == TDM2421GnssSource::FC_MAVLINK) {
+        if (strcmp(active_rec.sub_source, "OPEN_DRONE_ID_LOCATION") == 0 &&
+            have_last_good_mav_location) {
+            UAS_data.Location = last_good_mav_location;
+        } else {
+            apply_gnss_record_to_location(active_rec);
+        }
         UAS_data.LocationValid = 1;
         status_data_source = "MAVLink";
         selected_location_valid = true;
-    } else if (eg_gnss_fresh) {
-        // Priority 2: direct EG800K GNSS fallback.
-        apply_gnss_fix_to_location(eg_fix, 0.0f);
+        selected_location_age_ms = active_rec.age_ms;
+    } else if (active_src == TDM2421GnssSource::EG800K_GNSS) {
+        apply_gnss_record_to_location(active_rec);
         selected_location_valid = true;
-        selected_location_age_ms = eg_fix.age_ms;
+        selected_location_age_ms = active_rec.age_ms;
         status_data_source = "EG800K_GNSS";
-        status_reason = "MAVLink location unavailable; using EG800K GNSS";
+        status_reason = "FC GPS unavailable; using EG800K GNSS";
     } else {
         status_data_source = "NO_LOCATION";
         UAS_data.Location.Status = ODID_STATUS_REMOTE_ID_SYSTEM_FAILURE;
         UAS_data.LocationValid = 0;
-        status_reason = "No fresh MAVLink or EG800K GNSS location";
+        status_reason = "No fresh FC MAVLink or EG800K GNSS location";
     }
+    tdm2421_mqtt.setMavLocationFresh(active_src == TDM2421GnssSource::FC_MAVLINK);
 #else
     status_data_source = "MAVLink";
     if (!mav_location_fresh) {
         UAS_data.Location.Status = ODID_STATUS_REMOTE_ID_SYSTEM_FAILURE;
     }
-#endif
-
-    // A stale/missing System message must not destroy a valid EG800K fallback
-    // position. System validity remains whatever set_data() received.
     if (mav_location_fresh &&
         (last_system_ms == 0 || now_ms - last_system_ms > 5000)) {
         UAS_data.Location.Status = ODID_STATUS_REMOTE_ID_SYSTEM_FAILURE;
     }
+#endif
 
     // Evaluate ARM_STATUS only after the final location source has been
     // selected/restored. This prevents transient LOC/SYS errors caused by

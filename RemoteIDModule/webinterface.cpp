@@ -488,6 +488,31 @@ static void setupTDM2421Routes()
         if (server.hasArg("pub_ms")) cfg.publish_interval_ms = (uint32_t)server.arg("pub_ms").toInt();
         if (server.hasArg("recon_ms")) cfg.reconnect_interval_ms = (uint32_t)server.arg("recon_ms").toInt();
 
+        String new_basic_id;
+        if (server.hasArg("basic_id")) {
+            new_basic_id = server.arg("basic_id");
+            new_basic_id.trim();
+            if (new_basic_id.length() > 20) {
+                server.send(400, "text/plain", "Basic ID must be at most 20 characters");
+                return;
+            }
+            if (new_basic_id.length() > 0) {
+                // Nếu topic C2 đang theo mẫu mặc định p3000m/c2/<id_cũ>/tx|rx thì tự cập nhật theo Basic ID mới.
+                char old_tx[97] {};
+                char old_rx[97] {};
+                snprintf(old_tx, sizeof(old_tx), "p3000m/c2/%s/tx", g.uas_id);
+                snprintf(old_rx, sizeof(old_rx), "p3000m/c2/%s/rx", g.uas_id);
+                if (strcmp(cfg.c2_tx_topic, old_tx) == 0 ||
+                    strcmp(cfg.c2_tx_topic, "p3000m/c2/tx") == 0) {
+                    snprintf(cfg.c2_tx_topic, sizeof(cfg.c2_tx_topic), "p3000m/c2/%s/tx", new_basic_id.c_str());
+                }
+                if (strcmp(cfg.c2_rx_topic, old_rx) == 0 ||
+                    strcmp(cfg.c2_rx_topic, "p3000m/c2/rx") == 0) {
+                    snprintf(cfg.c2_rx_topic, sizeof(cfg.c2_rx_topic), "p3000m/c2/%s/rx", new_basic_id.c_str());
+                }
+            }
+        }
+
         String ap_ssid = server.hasArg("ap_ssid") ? server.arg("ap_ssid") : String(g.wifi_ssid);
         ap_ssid.trim();
         const int ap_channel = server.hasArg("ap_channel") ? server.arg("ap_channel").toInt() : g.wifi_channel;
@@ -506,18 +531,10 @@ static void setupTDM2421Routes()
         // Configure the actual OpenDroneID Basic ID from the local dashboard.
         // For this TDM2421 build the aircraft is a multirotor and the configured
         // identifier is treated as a serial-number Basic ID.
-        if (server.hasArg("basic_id")) {
-            String bid = server.arg("basic_id");
-            bid.trim();
-            if (bid.length() > 20) {
-                server.send(400, "text/plain", "Basic ID must be at most 20 characters");
-                return;
-            }
-            if (bid.length() > 0) {
-                g.set_by_name_uint8("UAS_TYPE", ODID_UATYPE_HELICOPTER_OR_MULTIROTOR);
-                g.set_by_name_uint8("UAS_ID_TYPE", ODID_IDTYPE_SERIAL_NUMBER);
-                g.set_by_name_string("UAS_ID", bid.c_str());
-            }
+        if (new_basic_id.length() > 0) {
+            g.set_by_name_uint8("UAS_TYPE", ODID_UATYPE_HELICOPTER_OR_MULTIROTOR);
+            g.set_by_name_uint8("UAS_ID_TYPE", ODID_IDTYPE_SERIAL_NUMBER);
+            g.set_by_name_string("UAS_ID", new_basic_id.c_str());
         }
 
         g.set_by_name_string("WIFI_SSID", ap_ssid.c_str());

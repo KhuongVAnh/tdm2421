@@ -95,7 +95,7 @@ private:
     void refreshSignal();
     void handleReconfigure();
     bool ensureGNSS();
-    void refreshGNSS();
+    void refreshGNSS(bool skip_dop = false);
     bool parseQGPSLOC(const String &response, TDM2421GNSSFix &fix);
     void refreshGNSSDOP();
     bool parseGSA(const String &response, float &pdop, float &hdop, float &vdop, uint8_t &used);
@@ -130,10 +130,7 @@ private:
     TDM2421ModemRxDemux rx_demux {};
 
     SemaphoreHandle_t state_mutex = nullptr;
-    SemaphoreHandle_t gnss_mutex = nullptr;
-    TDM2421GNSSFix gnss_fix {};
     bool gnss_started = false;
-    uint32_t gnss_last_fix_ms = 0;
     uint32_t gnss_last_dop_ms = 0;
     bool sim_ready = false;
     bool registered = false;

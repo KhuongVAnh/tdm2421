@@ -8,6 +8,7 @@
 #include "parameters.h"
 #if defined(BOARD_TDM2421)
 #include "tdm2421_c2.h"
+#include "tdm2421_gnss.h"
 #include "tdm2421_mqtt.h"
 #endif
 
@@ -328,6 +329,26 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
         last_native_odid_location_ms = now_ms;
         mav_rid_location_source = MAVRIDLocationSource::OPEN_DRONE_ID_LOCATION;
 #if defined(BOARD_TDM2421)
+        if (location.latitude >= -900000000L && location.latitude <= 900000000L &&
+            location.longitude >= -1800000000L && location.longitude <= 1800000000L &&
+            (location.latitude != 0 || location.longitude != 0)) {
+            TDM2421GnssRecord rec {};
+            rec.valid = true;
+            rec.latitude = location.latitude * 1.0e-7;
+            rec.longitude = location.longitude * 1.0e-7;
+            rec.altitude_msl_m = location.altitude_geodetic;
+            rec.height_agl_m = location.height;
+            rec.height_valid = (location.height > -999.0f);
+            rec.speed_mps = location.speed_horizontal * 0.01f;
+            rec.speed_vertical_mps = location.speed_vertical * 0.01f;
+            rec.course_valid = (location.direction <= 35999U);
+            rec.course_deg = rec.course_valid ? (location.direction * 0.01f) : 0.0f;
+            rec.odid_status = location.status;
+            rec.odid_timestamp_s = location.timestamp;
+            rec.updated_ms = now_ms;
+            snprintf(rec.sub_source, sizeof(rec.sub_source), "OPEN_DRONE_ID_LOCATION");
+            tdm2421_gnss.updateFc(rec);
+        }
         tdmDebugPrintf(2, "[MAV RX] OPEN_DRONE_ID_LOCATION lat=%.7f lon=%.7f alt=%.1f h=%.1f speed=%.2f\r\n",
                       location.latitude * 1.0e-7,
                       location.longitude * 1.0e-7,
@@ -355,7 +376,9 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
 
         mavlink_global_position_int_t p;
         mavlink_msg_global_position_int_decode(&msg, &p);
-        if (p.lat == 0 && p.lon == 0) {
+        if (p.lat < -900000000L || p.lat > 900000000L ||
+            p.lon < -1800000000L || p.lon > 1800000000L ||
+            (p.lat == 0 && p.lon == 0)) {
             break;
         }
 
@@ -388,6 +411,25 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
         last_location_timestamp = location.timestamp;
 
 #if defined(BOARD_TDM2421)
+        {
+            // Ghi tọa độ parse từ FC vào vùng nhớ chung (nguồn FC_MAVLINK) cho Remote ID.
+            TDM2421GnssRecord rec {};
+            rec.valid = true;
+            rec.latitude = p.lat * 1.0e-7;
+            rec.longitude = p.lon * 1.0e-7;
+            rec.altitude_msl_m = p.alt * 0.001f;
+            rec.height_agl_m = p.relative_alt * 0.001f;
+            rec.height_valid = true;
+            rec.speed_mps = location.speed_horizontal * 0.01f;
+            rec.speed_vertical_mps = location.speed_vertical * 0.01f;
+            rec.course_valid = (p.hdg != UINT16_MAX && p.hdg <= 35999U);
+            rec.course_deg = rec.course_valid ? (p.hdg * 0.01f) : 0.0f;
+            rec.odid_status = MAV_ODID_STATUS_AIRBORNE;
+            rec.odid_timestamp_s = location.timestamp;
+            rec.updated_ms = now_ms;
+            snprintf(rec.sub_source, sizeof(rec.sub_source), "GLOBAL_POSITION_INT");
+            tdm2421_gnss.updateFc(rec);
+        }
         tdmDebugPrintf(2, "[MAV RX] GLOBAL_POSITION_INT lat=%.7f lon=%.7f alt=%.1f rel=%.1f speed=%.2f hdg=%.1f\r\n",
                       location.latitude * 1.0e-7,
                       location.longitude * 1.0e-7,
@@ -409,7 +451,9 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
 
         mavlink_gps_raw_int_t p;
         mavlink_msg_gps_raw_int_decode(&msg, &p);
-        if (p.fix_type < 2 || (p.lat == 0 && p.lon == 0)) {
+        if (p.fix_type < 2 || p.lat < -900000000L || p.lat > 900000000L ||
+            p.lon < -1800000000L || p.lon > 1800000000L ||
+            (p.lat == 0 && p.lon == 0)) {
             break;
         }
 
@@ -440,6 +484,28 @@ void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &
         last_location_timestamp = location.timestamp;
 
 #if defined(BOARD_TDM2421)
+        {
+            TDM2421GnssRecord rec {};
+            rec.valid = true;
+            rec.latitude = p.lat * 1.0e-7;
+            rec.longitude = p.lon * 1.0e-7;
+            rec.altitude_msl_m = p.alt * 0.001f;
+            rec.height_agl_m = -1000.0f;
+            rec.height_valid = false;
+            rec.speed_mps = (p.vel == UINT16_MAX) ? 0.0f : (location.speed_horizontal * 0.01f);
+            rec.speed_vertical_mps = 0.0f;
+            rec.course_valid = (p.cog != UINT16_MAX && p.cog <= 35999U);
+            rec.course_deg = rec.course_valid ? (p.cog * 0.01f) : 0.0f;
+            rec.fix_type = p.fix_type;
+            rec.satellites = p.satellites_visible;
+            rec.hdop = (p.eph != UINT16_MAX) ? (p.eph * 0.01f) : 99.9f;
+            rec.dop_valid = (p.eph != UINT16_MAX);
+            rec.odid_status = MAV_ODID_STATUS_AIRBORNE;
+            rec.odid_timestamp_s = location.timestamp;
+            rec.updated_ms = now_ms;
+            snprintf(rec.sub_source, sizeof(rec.sub_source), "GPS_RAW_INT");
+            tdm2421_gnss.updateFc(rec);
+        }
         tdmDebugPrintf(2, "[MAV RX] GPS_RAW_INT fix=%u sats=%u lat=%.7f lon=%.7f alt=%.1f speed=%.2f\r\n",
                       (unsigned)p.fix_type, (unsigned)p.satellites_visible,
                       location.latitude * 1.0e-7,

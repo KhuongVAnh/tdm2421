@@ -216,9 +216,14 @@ def main() -> int:
     ap.add_argument("--mqtt-user", default="pilot")
     ap.add_argument("--mqtt-pass", default="pilot123")
     ap.add_argument("--client-id", default="TDM2421_QGC_TCP_BRIDGE")
-    ap.add_argument("--tx-topic", default="p3000m/c2/tx", help="Topic nhận binary MAVLink từ ESP32/FC")
-    ap.add_argument("--rx-topic", default="p3000m/c2/rx", help="Topic gửi lệnh binary MAVLink xuống ESP32/FC")
+    ap.add_argument("--remote-id", default="1866ASDD0000VT5", help="Remote ID của drone cần kết nối C2")
+    ap.add_argument("--tx-topic", default=None, help="Topic nhận binary MAVLink từ ESP32/FC (mặc định p3000m/c2/<remote-id>/tx)")
+    ap.add_argument("--rx-topic", default=None, help="Topic gửi lệnh binary MAVLink xuống ESP32/FC (mặc định p3000m/c2/<remote-id>/rx)")
     args = ap.parse_args()
+    if args.tx_topic is None:
+        args.tx_topic = f"p3000m/c2/{args.remote_id}/tx"
+    if args.rx_topic is None:
+        args.rx_topic = f"p3000m/c2/{args.remote_id}/rx"
 
     tcp_srv = open_tcp_server(args.tcp_host, args.tcp_port)
     qgc_sock: socket.socket | None = None
