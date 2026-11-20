@@ -12,7 +12,7 @@
 #include "status.h"
 #if defined(BOARD_TDM2421)
 #include "tdm2421_mqtt.h"
-#include "tdm2421_gps.h"
+#include "mavlink.h"
 #include "tdm2421_debug.h"
 #endif
 
@@ -194,41 +194,31 @@ static String tdmDashboardHtml()
            "<div class='row'><span>Speed</span><span class='v' id='speed'></span></div>"
            "<div class='row'><span>Heading</span><span class='v' id='hdg'></span></div></div></div>");
 
-#if TDM2421_USE_EXT_GPS
-    // Thẻ điều khiển & giám sát riêng cho module GPS ngoài trên Serial1 (GPIO 4/5).
-    h += F("<div class='card'><h3>Module GPS Ngoài (Serial1 - GPIO 4/5)</h3>"
+    // Thẻ giám sát kết nối Flight Controller & chỉnh baudrate UART1 (GPIO 6/7).
+    h += F("<div class='card'><h3>Kết nối Flight Controller (UART1 - GPIO 6/7)</h3>"
            "<div class='two'><div>"
-           "<div class='row'><span>Trạng thái kết nối</span><span class='v' id='extgps_conn'></span></div>"
-           "<div class='row'><span>Tần số cấu hình</span><span class='v' id='extgps_cfg_hz'></span></div>"
-           "<div class='row'><span>Tần số thực tế</span><span class='v' id='extgps_meas_hz'></span></div>"
-           "<div class='row'><span>Tuổi gói NMEA</span><span class='v' id='extgps_age'></span></div>"
-           "<div class='row'><span>Fix / Vệ tinh</span><span class='v' id='extgps_fix'></span></div>"
+           "<div class='row'><span>Trạng thái kết nối FC</span><span class='v' id='fc_conn'></span></div>"
+           "<div class='row'><span>MAVLink Heartbeat</span><span class='v' id='fc_hb'></span></div>"
+           "<div class='row'><span>FC System / Comp ID</span><span class='v' id='fc_ids'></span></div>"
+           "<div class='row'><span>Tuổi gói Heartbeat</span><span class='v' id='fc_hb_age'></span></div>"
            "</div><div>"
-           "<div class='row'><span>Latitude</span><span class='v' id='extgps_lat'></span></div>"
-           "<div class='row'><span>Longitude</span><span class='v' id='extgps_lon'></span></div>"
-           "<div class='row'><span>Altitude</span><span class='v' id='extgps_alt'></span></div>"
-           "<div class='row'><span>Speed</span><span class='v' id='extgps_spd'></span></div>"
-           "<div class='row'><span>HDOP</span><span class='v' id='extgps_hdop'></span></div>"
+           "<div class='row'><span>Baudrate đang chạy</span><span class='v' id='fc_baud_cur'></span></div>"
+           "<div class='row'><span>Nguồn tọa độ</span><span class='v' id='fc_loc_src'></span></div>"
+           "<div class='row'><span>Gói MAVLink đã nhận</span><span class='v' id='fc_rx_frames'></span></div>"
+           "<div class='row'><span>Dung lượng UART1 RX</span><span class='v' id='fc_rx_bytes'></span></div>"
            "</div></div>"
            "<div class='two' style='margin-top:12px;align-items:end'><div>"
-           "<label>Tần số tính toán GPS</label>"
-           "<select id='extgps_rate_sel'>");
-    const uint8_t cur_hz = tdm2421_gps.getConfiguredHz();
-    h += String("<option value='1'") + (cur_hz == 1 ? " selected" : "") + ">1 Hz (1000 ms)</option>";
-    h += String("<option value='5'") + (cur_hz == 5 ? " selected" : "") + ">5 Hz (200 ms)</option>";
-    h += String("<option value='10'") + (cur_hz == 10 ? " selected" : "") + ">10 Hz (100 ms)</option>";
+           "<label>Baudrate UART1 giao tiếp FC (bps)</label>"
+           "<select id='fc_baud_sel'>");
+    static const uint32_t baud_opts[] = {9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
+    for (uint32_t b : baud_opts) {
+        h += String("<option value='") + String(b) + "'" + (g.baudrate == b ? " selected" : "") + ">" + String(b) + " bps</option>";
+    }
     h += F("</select></div>"
            "<div class='btn-row'>"
-           "<button type='button' onclick='applyGpsRate()'>Áp dụng tần số</button>"
-           "<button type='button' class='btn-sec' id='btn_gps_test' onclick='runGpsTest()'>Test module (1s)</button>"
+           "<button type='button' onclick='applyFcBaudrate()'>Áp dụng Baudrate</button>"
            "</div></div>"
-           "<p class='note' id='extgps_msg'></p>"
-           "<div id='extgps_test_box' style='display:none;margin-top:10px'>"
-           "<strong>Kết quả thu từ module GPS trong 1 giây:</strong>"
-           "<div class='row'><span>Kết nối / Tần số đo được</span><span class='v' id='test_summary'></span></div>"
-           "<div class='row'><span>Dữ liệu giải mã</span><span class='v' id='test_fix'></span></div>"
-           "<pre class='gpsbox' id='test_samples'></pre></div></div>");
-#endif
+           "<p class='note' id='fc_msg'>Lưu vào NVS (BAUDRATE) và áp dụng ngay cho UART1 (GPIO 6 RX / GPIO 7 TX) không cần reboot.</p></div>");
 
     // Thẻ chỉnh nhanh tạm thời trên RAM: không lưu NVS, không cần reboot, tắt bật lại sẽ về mặc định.
     const uint32_t cur_mqtt_hz = (cfg.publish_interval_ms > 0U)
@@ -301,32 +291,19 @@ static String tdmDashboardHtml()
            "set('mqtt',yn(t.mqttConnected));set('broker',t.broker);set('topic',t.topic);set('mqtt_rate',rateTxt);set('msgcnt',t.msgCnt);set('pubage',t.lastPublishAgeMs? t.lastPublishAgeMs+' ms':'-');set('err',t.lastError);"
            "set('source',q['STATUS:DATA_SOURCE']);set('mav',q['MAVLINK:Connected']);let bid=q['BASICID:UASID']||'';set('basic_id',bid||'N/A');set('basic_type',q['BASICID:IDType']||'N/A');set('basic_source',bid?'OpenDroneID Basic ID':'Device ID fallback');set('device_id',t.deviceId);set('uav_serial',t.uavSerial||bid||t.deviceId);set('object_id',bid||t.deviceId);set('lat',q['LOCATION:Latitude']);set('lon',q['LOCATION:Longitude']);set('alt',q['LOCATION:AltitudeGeo']+' m');set('speed',q['LOCATION:SpeedHorizontal']+' m/s');set('hdg',q['LOCATION:Direction']+' deg');"
            "set('temp_cur_id',bid||'N/A');set('temp_cur_rate',rateTxt);"
-#if TDM2421_USE_EXT_GPS
-           "let g=j.extgps||{};"
-           "set('extgps_conn',g.connected?'<span class=ok>ĐÃ CẮM</span>':'<span class=bad>CHƯA CẮM</span>');"
-           "set('extgps_cfg_hz',(g.configuredHz||'-')+' Hz');"
-           "set('extgps_meas_hz',g.connected?(g.measuredHz+' Hz'):'-');"
-           "set('extgps_age',g.nmeaAgeMs?g.nmeaAgeMs+' ms':'-');"
-           "set('extgps_fix',(g.fixValid?(g.fixType+'D FIX'):'NO FIX')+' / '+(g.sats||0)+' sats');"
-           "set('extgps_lat',g.fixValid?g.lat:'-');set('extgps_lon',g.fixValid?g.lon:'-');"
-           "set('extgps_alt',g.fixValid?(g.alt+' m'):'-');set('extgps_spd',g.fixValid?(g.speed+' m/s'):'-');"
-           "set('extgps_hdop',g.connected?g.hdop:'-');"
-#endif
+           "let fc=j.fc||{};"
+           "set('fc_conn',fc.connected?'<span class=ok>ĐÃ KẾT NỐI</span>':'<span class=bad>CHƯA KẾT NỐI</span>');"
+           "set('fc_hb',fc.heartbeatConnected?'<span class=ok>CÓ</span>':'<span class=bad>KHÔNG</span>');"
+           "set('fc_ids',fc.sysid?(fc.sysid+':'+fc.compid):'-');"
+           "set('fc_hb_age',fc.heartbeatAgeMs?fc.heartbeatAgeMs+' ms':'-');"
+           "set('fc_baud_cur',fc.baudrate?(fc.baudrate+' bps'):'-');"
+           "set('fc_loc_src',fc.locationSource||'-');"
+           "set('fc_rx_frames',fc.rxFrames!==undefined?fc.rxFrames:'-');"
+           "set('fc_rx_bytes',fc.rxBytes!==undefined?(fc.rxBytes+' B'):'-');"
            "}catch(e){set('err','dashboard poll failed');}}"
-#if TDM2421_USE_EXT_GPS
-           "async function applyGpsRate(){let hz=document.getElementById('extgps_rate_sel').value;set('extgps_msg','Đang gửi lệnh đổi tần số '+hz+' Hz...');"
-           "try{let r=await fetch('/api/extgps/rate?hz='+encodeURIComponent(hz),{method:'POST'});let j=await r.json();"
-           "set('extgps_msg',j.ok?('Đã cấu hình GPS sang '+j.hz+' Hz và lưu NVS.'):'Lỗi cấu hình tần số GPS.');poll();}catch(e){set('extgps_msg','Không gửi được yêu cầu đổi tần số.');}}"
-           "async function runGpsTest(){let btn=document.getElementById('btn_gps_test');btn.disabled=true;btn.textContent='Đang thu 1s...';set('extgps_msg','Đang thu dữ liệu từ module GPS trong 1 giây...');"
-           "try{await fetch('/api/extgps/test',{method:'POST'});await new Promise(res=>setTimeout(res,1100));"
-           "let r=await fetch('/api/extgps/test',{cache:'no-store'});let d=await r.json();let tries=0;"
-           "while(d.active&&tries<10){await new Promise(res=>setTimeout(res,150));r=await fetch('/api/extgps/test',{cache:'no-store'});d=await r.json();tries++;}"
-           "document.getElementById('extgps_test_box').style.display='block';"
-           "set('test_summary',(d.connected?'ĐÃ CẮM':'CHƯA CẮM')+' | '+d.byteCount+' bytes | RMC='+d.rmcCount+' GGA='+d.ggaCount+' GSV='+d.gsvCount+' | Thấy '+(d.satsInView||0)+' vệ tinh, max SNR='+(d.maxSnr||0)+' dB-Hz (~'+d.measuredHz+' Hz)');"
-           "set('test_fix',d.fixValid?(d.fixType+'D FIX | sats='+d.sats+' | lat='+d.lat+' lon='+d.lon+' | alt='+d.alt+'m | spd='+d.speed+'m/s | hdop='+d.hdop):'Chưa có fix vệ tinh (NO FIX)');"
-           "document.getElementById('test_samples').textContent=d.samples||'(Không nhận được câu NMEA nào trong 1 giây — kiểm tra dây TX/RX GPIO 4/5 hoặc nguồn GPS)';"
-           "set('extgps_msg','Test hoàn tất.');}catch(e){set('extgps_msg','Lỗi khi test module GPS.');}finally{btn.disabled=false;btn.textContent='Test module (1s)';}}"
-#endif
+           "async function applyFcBaudrate(){let baud=document.getElementById('fc_baud_sel').value;set('fc_msg','Đang đổi baudrate UART1 sang '+baud+' bps...');"
+           "try{let r=await fetch('/api/fc/baudrate?baud='+encodeURIComponent(baud),{method:'POST'});let j=await r.json();"
+           "set('fc_msg',j.ok?('Đã áp dụng ngay baudrate '+j.baud+' bps và lưu NVS.'):('Lỗi: '+(j.error||'Baudrate không hợp lệ')));poll();}catch(e){set('fc_msg','Không gửi được yêu cầu đổi baudrate.');}}"
            "async function applyTempConfig(){"
            "let bid=document.getElementById('temp_basic_id').value.trim();"
            "let hz=document.getElementById('temp_mqtt_hz').value.trim();"
@@ -352,6 +329,7 @@ static void setupTDM2421Routes()
         String s = "{";
         s += "\"apSsid\":\"" + jsonEscape(g.wifi_ssid) + "\",";
         s += "\"apChannel\":" + String(g.wifi_channel) + ",";
+        s += "\"fcBaudrate\":" + String((unsigned long)g.baudrate) + ",";
         s += "\"mqtt\":" + tdm2421_mqtt.configJson();
         s += "}";
         server.send(200, "application/json", s);
@@ -362,9 +340,7 @@ static void setupTDM2421Routes()
         s = "{";
         s += "\"tdm\":" + tdm2421_mqtt.statusJson() + ",";
         s += "\"rid\":" + status_json() + ",";
-#if TDM2421_USE_EXT_GPS
-        s += "\"extgps\":" + tdm2421_gps.statusJson() + ",";
-#endif
+        s += "\"fc\":" + mavlink_fc_status_json() + ",";
         s += "\"ap\":{";
         s += "\"ssid\":\"" + jsonEscape(g.wifi_ssid) + "\",";
         s += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
@@ -374,30 +350,32 @@ static void setupTDM2421Routes()
         server.sendHeader("Cache-Control", "no-store");
         server.send(200, "application/json", s);
     });
-#if TDM2421_USE_EXT_GPS
-    // API đổi tần số tính toán GPS ngoài (chỉ nhận 1, 5 hoặc 10 Hz) và lưu NVS.
-    server.on("/api/extgps/rate", HTTP_POST, []() {
-        const int hz = server.hasArg("hz") ? server.arg("hz").toInt() : 0;
-        const bool ok = (hz == 1 || hz == 5 || hz == 10) && tdm2421_gps.setRateHz((uint8_t)hz);
+    // API đổi baudrate UART1 giao tiếp Flight Controller (lưu NVS BAUDRATE và áp dụng ngay).
+    server.on("/api/fc/baudrate", HTTP_POST, []() {
+        const uint32_t baud = server.hasArg("baud") ? (uint32_t)server.arg("baud").toInt() : 0;
+        static const uint32_t valid_bauds[] = {9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
+        bool valid = false;
+        for (uint32_t b : valid_bauds) {
+            if (baud == b) {
+                valid = true;
+                break;
+            }
+        }
         server.sendHeader("Cache-Control", "no-store");
-        if (!ok) {
-            server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid hz (use 1, 5, or 10)\"}");
+        if (!valid) {
+            server.send(400, "application/json", "{\"ok\":false,\"error\":\"Baudrate khong hop le\"}");
             return;
         }
-        server.send(200, "application/json", String("{\"ok\":true,\"hz\":") + String(hz) + "}");
+        char buf[16] {};
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)baud);
+        if (!g.set_by_name_string("BAUDRATE", buf)) {
+            server.send(500, "application/json", "{\"ok\":false,\"error\":\"Khong luu duoc BAUDRATE vao NVS\"}");
+            return;
+        }
+        Serial1.updateBaudRate(baud);
+        tdmDebugPrintf(1, "[FC UART] baudrate updated to %lu bps\r\n", (unsigned long)baud);
+        server.send(200, "application/json", String("{\"ok\":true,\"baud\":") + String((unsigned long)baud) + "}");
     });
-    // API bắt đầu thu mẫu 1 giây từ module GPS ngoài (không chặn loop).
-    server.on("/api/extgps/test", HTTP_POST, []() {
-        tdm2421_gps.startTestCapture(1000);
-        server.sendHeader("Cache-Control", "no-store");
-        server.send(200, "application/json", "{\"started\":true,\"durationMs\":1000}");
-    });
-    // API lấy kết quả sau khi thu mẫu 1 giây từ module GPS ngoài.
-    server.on("/api/extgps/test", HTTP_GET, []() {
-        server.sendHeader("Cache-Control", "no-store");
-        server.send(200, "application/json", tdm2421_gps.testStatusJson());
-    });
-#endif
     // API chỉnh nhanh Remote ID và tần số publish MQTT tạm thời trên RAM:
     // áp dụng ngay không cần reboot/reconnect, không ghi NVS nên lần boot sau tự về mặc định.
     server.on("/api/temp_config", HTTP_POST, []() {

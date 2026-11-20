@@ -24,6 +24,17 @@ static uint32_t last_mav_rx_report_ms;
 static uint32_t mav_rx_frames;
 static uint32_t mav_rx_bytes;
 
+// Thống kê kết nối Flight Controller trên Serial1 (UART MAVLink).
+static constexpr uint32_t FC_CONNECT_TIMEOUT_MS = 3500;
+static uint32_t fc_last_heartbeat_ms = 0;
+static uint32_t fc_last_rx_frame_ms = 0;
+static uint8_t fc_sysid = 0;
+static uint8_t fc_compid = 0;
+static uint8_t fc_autopilot = 0;
+static uint8_t fc_mav_type = 0;
+static uint32_t fc_rx_frames_total = 0;
+static uint32_t fc_rx_bytes_total = 0;
+
 enum class MAVRIDLocationSource : uint8_t {
     NONE = 0,
     OPEN_DRONE_ID_LOCATION,
@@ -41,6 +52,43 @@ const char *mavlink_location_source_name(void)
     case MAVRIDLocationSource::GPS_RAW_INT:          return "GPS_RAW_INT";
     default:                                          return "NONE";
     }
+}
+
+bool mavlink_fc_connected(void)
+{
+    const uint32_t now_ms = millis();
+    if (fc_last_heartbeat_ms != 0 && (uint32_t)(now_ms - fc_last_heartbeat_ms) <= FC_CONNECT_TIMEOUT_MS) {
+        return true;
+    }
+    return fc_last_rx_frame_ms != 0 && (uint32_t)(now_ms - fc_last_rx_frame_ms) <= FC_CONNECT_TIMEOUT_MS;
+}
+
+String mavlink_fc_status_json(void)
+{
+    const uint32_t now_ms = millis();
+    const bool hb_connected = fc_last_heartbeat_ms != 0 &&
+                                (uint32_t)(now_ms - fc_last_heartbeat_ms) <= FC_CONNECT_TIMEOUT_MS;
+    const bool connected = mavlink_fc_connected();
+    const uint32_t hb_age_ms = fc_last_heartbeat_ms == 0 ? 0 : (uint32_t)(now_ms - fc_last_heartbeat_ms);
+    const uint32_t rx_age_ms = fc_last_rx_frame_ms == 0 ? 0 : (uint32_t)(now_ms - fc_last_rx_frame_ms);
+
+    String s = "{";
+    s += "\"connected\":" + String(connected ? "true" : "false") + ",";
+    s += "\"heartbeatConnected\":" + String(hb_connected ? "true" : "false") + ",";
+    s += "\"sysid\":" + String((unsigned)fc_sysid) + ",";
+    s += "\"compid\":" + String((unsigned)fc_compid) + ",";
+    s += "\"autopilot\":" + String((unsigned)fc_autopilot) + ",";
+    s += "\"mavType\":" + String((unsigned)fc_mav_type) + ",";
+    s += "\"heartbeatAgeMs\":" + String((unsigned long)hb_age_ms) + ",";
+    s += "\"rxAgeMs\":" + String((unsigned long)rx_age_ms) + ",";
+    s += "\"locationSource\":\"" + String(mavlink_location_source_name()) + "\",";
+    s += "\"rxFrames\":" + String((unsigned long)fc_rx_frames_total) + ",";
+    s += "\"rxBytes\":" + String((unsigned long)fc_rx_bytes_total) + ",";
+    s += "\"baudrate\":" + String((unsigned long)g.baudrate) + ",";
+    s += "\"rxPin\":" + String((int)PIN_UART_RX) + ",";
+    s += "\"txPin\":" + String((int)PIN_UART_TX);
+    s += "}";
+    return s;
 }
 
 static float mav_location_timestamp(uint32_t now_ms)
@@ -178,6 +226,7 @@ void MAVLinkSerial::update_receive(void)
 
     const uint16_t nbytes = serial.available();
     mav_rx_bytes += nbytes;
+    fc_rx_bytes_total += nbytes;
     for (uint16_t i=0; i<nbytes; i++) {
         const uint8_t c = (uint8_t)serial.read();
         // Try to get a new message
@@ -223,12 +272,20 @@ void MAVLinkSerial::mav_printf(uint8_t severity, const char *fmt, ...)
 void MAVLinkSerial::process_packet(mavlink_status_t &status, mavlink_message_t &msg)
 {
     const uint32_t now_ms = millis();
+    fc_rx_frames_total++;
+    fc_last_rx_frame_ms = now_ms;
     switch (msg.msgid) {
     case MAVLINK_MSG_ID_HEARTBEAT: {
         mavlink_heartbeat_t hb;
-        if (mavlink_system.sysid == 0) {
-            mavlink_msg_heartbeat_decode(&msg, &hb);
-            if (msg.sysid > 0 && hb.type != MAV_TYPE_GCS) {
+        mavlink_msg_heartbeat_decode(&msg, &hb);
+        if (msg.sysid > 0 && hb.type != MAV_TYPE_GCS &&
+            msg.compid != MAV_COMP_ID_ODID_TXRX_1) {
+            fc_last_heartbeat_ms = now_ms;
+            fc_sysid = msg.sysid;
+            fc_compid = msg.compid;
+            fc_autopilot = hb.autopilot;
+            fc_mav_type = hb.type;
+            if (mavlink_system.sysid == 0) {
                 mavlink_system.sysid = msg.sysid;
             }
         }

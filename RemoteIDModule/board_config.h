@@ -169,20 +169,7 @@
 
 #define BOARD_ID 13
 
-// Chế độ chạy độc lập không có cổng UART MAVLink từ Flight Controller:
-//   - Đặt TDM2421_USE_EXT_GPS = 1 để chuyển UART1 phần cứng (Serial1) sang đọc
-//     module GPS ngoài 10 Hz qua chân GPIO 4/5, đồng thời tắt hỏi GNSS trên
-//     EG800K để Serial0 dành 100% băng thông cho LTE/MQTT.
-//   - Đặt TDM2421_USE_EXT_GPS = 0 để khôi phục MAVLink trên GPIO 6/7 và chế độ
-//     dự phòng EG800K GNSS như ban đầu.
-#define TDM2421_USE_EXT_GPS 1
-
-// UART1 -> GPS ngoài 10 Hz (GPIO 4 là RX nối TX của GPS, GPIO 5 là TX nối RX của GPS)
-#define PIN_GPS_UART_RX 4
-#define PIN_GPS_UART_TX 5
-#define GPS_UART_BAUD   115200
-
-// UART1 -> Pixhawk MAVLink (chân cũ; không sử dụng khi TDM2421_USE_EXT_GPS == 1)
+// UART1 -> Flight Controller MAVLink (GPIO 6 là RX nối TX của FC, GPIO 7 là TX nối RX của FC)
 #define PIN_UART_TX 7
 #define PIN_UART_RX 6
 

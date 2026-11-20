@@ -9,6 +9,10 @@
 // Returns: OPEN_DRONE_ID_LOCATION, GLOBAL_POSITION_INT, GPS_RAW_INT, or NONE.
 const char *mavlink_location_source_name(void);
 
+// Trạng thái kết nối FC qua cổng UART MAVLink (Serial1).
+bool mavlink_fc_connected(void);
+String mavlink_fc_status_json(void);
+
 /*
   abstraction for MAVLink on a serial port
  */
