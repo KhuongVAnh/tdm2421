@@ -6,6 +6,7 @@ Chỉ dùng thư viện chuẩn Python 3 (không cần cài thêm package ngoài
 Cách dùng:
   1. Chạy script:
        python3 scripts/c2_mqtt_tcp_bridge.py
+       python3 scripts/c2_mqtt_tcp_bridge.py --remote-id 1866ASDD0000VT6
   2. Trên QGroundControl (Application Settings -> Comm Links -> Add):
        - Type: TCP
        - Server Address: 127.0.0.1

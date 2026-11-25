@@ -2,12 +2,47 @@
 #include <Arduino.h>
 #include "parameters.h"
 #include <nvs_flash.h>
+#if defined(BOARD_TDM2421)
+#include <esp_flash.h>
+#endif
 #include <string.h>
 #include "romfs.h"
 #include "util.h"
 
+#if defined(BOARD_TDM2421)
+// Arduino-ESP32 2.0.3 esp32c3 SDK is compiled with CONFIG_ESPTOOLPY_FLASHMODE_QIO=y,
+// so esp_flash_default_chip->read_mode defaults to SPI_FLASH_QIO (5) even when the
+// image is built in DIO mode. On TDM2421 (flash 0x464016), QIO reads corrupt data
+// via esp_flash_read/nvs_flash, causing NVS to wipe on every boot. Force DIO before
+// initArduino() runs nvs_flash_init().
+__attribute__((constructor)) static void tdm2421_fix_flash_read_mode(void)
+{
+    if (esp_flash_default_chip != nullptr && esp_flash_default_chip->read_mode > SPI_FLASH_DIO) {
+        esp_flash_default_chip->read_mode = SPI_FLASH_DIO;
+        esp_flash_init(esp_flash_default_chip);
+    }
+}
+#endif
+
 Parameters g;
 static nvs_handle handle;
+static bool nvs_ready = false;
+
+static void commit_nvs_write(esp_err_t err, const char *name)
+{
+    if (!nvs_ready) {
+        Serial.printf("NVS not ready when writing %s\r\n", name);
+        return;
+    }
+    if (err != ESP_OK) {
+        Serial.printf("NVS set %s failed: %d\r\n", name, (int)err);
+        return;
+    }
+    const esp_err_t commit_err = nvs_commit(handle);
+    if (commit_err != ESP_OK) {
+        Serial.printf("NVS commit %s failed: %d\r\n", name, (int)commit_err);
+    }
+}
 
 const Parameters::Param Parameters::params[] = {
     { "LOCK_LEVEL",        Parameters::ParamType::INT8,  (const void*)&g.lock_level,       0, -1, 2 },
@@ -155,7 +190,7 @@ void Parameters::Param::set_uint8(uint8_t v) const
 {
     auto *p = (uint8_t *)ptr;
     *p = v;
-    nvs_set_u8(handle, name, *p);
+    commit_nvs_write(nvs_set_u8(handle, name, *p), name);
     if (strcmp(name, "TO_DEFAULTS") == 0) {
         if (v == 1) {
             nvs_flash_erase();
@@ -168,14 +203,14 @@ void Parameters::Param::set_int8(int8_t v) const
 {
     auto *p = (int8_t *)ptr;
     *p = v;
-    nvs_set_i8(handle, name, *p);
+    commit_nvs_write(nvs_set_i8(handle, name, *p), name);
 }
 
 void Parameters::Param::set_uint32(uint32_t v) const
 {
     auto *p = (uint32_t *)ptr;
     *p = v;
-    nvs_set_u32(handle, name, *p);
+    commit_nvs_write(nvs_set_u32(handle, name, *p), name);
 }
 
 void Parameters::Param::set_float(float v) const
@@ -187,7 +222,7 @@ void Parameters::Param::set_float(float v) const
         uint32_t u32;
     } u;
     u.f = v;
-    nvs_set_u32(handle, name, u.u32);
+    commit_nvs_write(nvs_set_u32(handle, name, u.u32), name);
 }
 
 void Parameters::Param::set_char20(const char *v) const
@@ -197,7 +232,7 @@ void Parameters::Param::set_char20(const char *v) const
     }
     memset((void*)ptr, 0, 21);
     strncpy((char *)ptr, v, 20);
-    nvs_set_str(handle, name, v);
+    commit_nvs_write(nvs_set_str(handle, name, (const char *)ptr), name);
 }
 
 void Parameters::Param::set_char64(const char *v) const
@@ -207,7 +242,7 @@ void Parameters::Param::set_char64(const char *v) const
     }
     memset((void*)ptr, 0, 65);
     strncpy((char *)ptr, v, 64);
-    nvs_set_str(handle, name, v);
+    commit_nvs_write(nvs_set_str(handle, name, (const char *)ptr), name);
 }
 
 uint8_t Parameters::Param::get_uint8() const
@@ -319,9 +354,19 @@ void Parameters::init(void)
 {
     load_defaults();
 
-    if (nvs_flash_init() != ESP_OK ||
-        nvs_open("storage", NVS_READWRITE, &handle) != ESP_OK) {
-        Serial.printf("NVS init failed\r\n");
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        Serial.printf("NVS needs erase (%d), erasing...\r\n", (int)nvs_err);
+        if (nvs_flash_erase() == ESP_OK) {
+            nvs_err = nvs_flash_init();
+        }
+    }
+    const esp_err_t open_err = (nvs_err == ESP_OK) ? nvs_open("storage", NVS_READWRITE, &handle) : nvs_err;
+    if (nvs_err != ESP_OK || open_err != ESP_OK) {
+        nvs_ready = false;
+        Serial.printf("NVS init failed: %d open=%d\r\n", (int)nvs_err, (int)open_err);
+    } else {
+        nvs_ready = true;
     }
     // load values from NVS
     for (const auto &p : params) {
