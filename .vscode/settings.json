@@ -1,3 +1,4 @@
 {
-    "ros.distro": "humble"
+    "ros.distro": "humble",
+    "cmake.sourceDirectory": "/home/kva_linux_os/project/arduremoteid_TDM2421/c2_qt_bridge"
 }

@@ -47,3 +47,15 @@ target_link_libraries(test_mqtt_codec PRIVATE
 )
 
 add_test(NAME test_mqtt_codec COMMAND test_mqtt_codec)
+
+include(GNUInstallDirs)
+
+install(TARGETS tdm2421_c2_bridge
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+install(FILES packaging/tdm2421_c2_bridge.desktop
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/applications
+)
+install(FILES packaging/tdm2421_c2_bridge.svg
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps
+)

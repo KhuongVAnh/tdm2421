@@ -1,0 +1,115 @@
+name: Build C2 Qt Bridge (Linux AppImage)
+
+on:
+  push:
+    branches:
+      - c2
+    paths:
+      - "c2_qt_bridge/**"
+      - ".github/workflows/c2_qt_bridge_appimage.yml"
+  workflow_dispatch:
+
+jobs:
+  build-linux-appimage:
+    name: Linux x86_64 AppImage (Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build and XCB dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            libgl1-mesa-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xinerama0 \
+            libxcb-xkb1 \
+            libfuse2 \
+            xvfb \
+            wget \
+            file
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.5.3"
+          host: "linux"
+          target: "desktop"
+          arch: "linux_gcc_64"
+          cache: "true"
+
+      - name: Configure and build C2 Qt Bridge
+        run: |
+          cmake -S c2_qt_bridge -B c2_qt_bridge/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build c2_qt_bridge/build --parallel
+
+      - name: Run unit tests (ctest)
+        run: |
+          ctest --test-dir c2_qt_bridge/build --output-on-failure
+
+      - name: Install into AppDir
+        run: |
+          rm -rf AppDir
+          DESTDIR="${PWD}/AppDir" cmake --install c2_qt_bridge/build --prefix /usr
+
+      - name: Package AppImage with linuxdeploy
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          LINUXDEPLOY_OUTPUT_VERSION: "${{ github.run_number }}"
+        run: |
+          mkdir -p tools dist
+          wget -q -O tools/linuxdeploy-x86_64.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q -O tools/linuxdeploy-plugin-qt-x86_64.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x tools/linuxdeploy-x86_64.AppImage tools/linuxdeploy-plugin-qt-x86_64.AppImage
+
+          export QMAKE="$(command -v qmake || command -v qmake6)"
+          export PATH="${PWD}/tools:${PATH}"
+          export LD_LIBRARY_PATH="$("$QMAKE" -query QT_INSTALL_LIBS):${LD_LIBRARY_PATH:-}"
+
+          ./tools/linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            -d AppDir/usr/share/applications/tdm2421_c2_bridge.desktop \
+            -i AppDir/usr/share/icons/hicolor/scalable/apps/tdm2421_c2_bridge.svg \
+            --plugin qt \
+            --output appimage
+
+          mv ./*.AppImage dist/TDM2421_C2_Bridge-x86_64.AppImage
+          chmod +x dist/TDM2421_C2_Bridge-x86_64.AppImage
+          ls -lh dist/TDM2421_C2_Bridge-x86_64.AppImage
+
+      - name: Smoke test AppImage launch (Xvfb)
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set +e
+          xvfb-run -a timeout 3s ./dist/TDM2421_C2_Bridge-x86_64.AppImage
+          rc=$?
+          set -e
+          echo "Smoke test exit code: $rc"
+          if [ "$rc" -ne 124 ] && [ "$rc" -ne 0 ]; then
+            echo "AppImage failed to launch cleanly!"
+            exit "$rc"
+          fi
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdm2421-c2-bridge-linux-appimage
+          path: dist/TDM2421_C2.AppImage
+          if-no-files-found: error
+          retention-days: 30

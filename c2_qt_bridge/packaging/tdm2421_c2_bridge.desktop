@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TDM2421 C2 Bridge
+GenericName=MAVLink MQTT C2 Bridge
+Comment=Bridge MQTT C2 <-> QGroundControl TCP for TDM2421
+Exec=tdm2421_c2_bridge
+Icon=tdm2421_c2_bridge
+Categories=Network;Utility;
+Terminal=false
+StartupWMClass=tdm2421_c2_bridge
