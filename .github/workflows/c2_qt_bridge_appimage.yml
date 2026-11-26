@@ -45,7 +45,7 @@ jobs:
       - name: Install Qt 6
         uses: jurplel/install-qt-action@v4
         with:
-          version: "6.5.3"
+          version: "6.8.3"
           host: "linux"
           target: "desktop"
           arch: "linux_gcc_64"
@@ -110,6 +110,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tdm2421-c2-bridge-linux-appimage
-          path: dist/TDM2421_C2.AppImage
+          path: dist/TDM2421_C2_Bridge-x86_64.AppImage
           if-no-files-found: error
           retention-days: 30
